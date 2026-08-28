@@ -1,0 +1,11 @@
+# Secrets & state — DO NOT commit
+.env
+*.session
+*.session-journal
+forwarder.db
+forwarder.db-journal
+__pycache__/
+*.pyc
+.venv/
+venv/
+tmp/

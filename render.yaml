@@ -1,0 +1,62 @@
+# Render Blueprint — deploys the Telegram Forwarder Bot to Render's free tier.
+#
+# How to use:
+#   1. Push this repo to GitHub
+#   2. Go to https://dashboard.render.com -> New -> Blueprint
+#   3. Select your repo. Render reads render.yaml and creates the service.
+#   4. After the first deploy, copy the service URL (e.g. https://your-name.onrender.com)
+#      and set the WEBHOOK_URL env var to it. Then redeploy.
+#
+# Alternatively, deploy manually via:
+#   https://dashboard.render.com -> New + -> Web Service -> connect repo
+#
+# Free-tier caveats:
+#   * The service sleeps after 15 min of inactivity
+#   * First request after sleep takes ~30-60 sec to wake up (Render cold start)
+#   * 512 MB RAM, 0.1 CPU — plenty for this bot
+#   * Ephemeral disk — that's why we use StringSession, not a session file
+
+services:
+  - type: web
+    name: telegram-forwarder-bot
+    runtime: python
+    plan: free
+    # Choose the region closest to your users (oregon / ohio / frankfurt / singapore)
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    # Auto-deploy when you push to your default branch
+    autoDeploy: true
+    # Health check path — Render will ping this to verify the service is alive
+    # Note: python-telegram-bot's webhook server returns 404 for unknown paths,
+    # which is fine — Render considers any HTTP response as "alive"
+    healthCheckPath: /
+    envVars:
+      # ===== Mode (REQUIRED) — must be webhook for Render =====
+      - key: MODE
+        value: webhook
+      # ===== Secrets — set these in Render dashboard after first deploy =====
+      # sync: false means Render won't try to generate a value, you must enter it
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: DESTINATION_GROUP_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      # ===== Webhook URL =====
+      # Set this to https://<service-name>.onrender.com AFTER the first deploy
+      # (you won't know the URL until Render creates the service)
+      - key: WEBHOOK_URL
+        sync: false
+      # ===== DB on ephemeral disk — lose on restart, that's fine =====
+      - key: DB_PATH
+        value: /tmp/forwarder.db
+      # ===== Python version (must match .python-version file) =====
+      - key: PYTHON_VERSION
+        value: "3.12.0"

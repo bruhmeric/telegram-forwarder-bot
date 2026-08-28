@@ -1,0 +1,8 @@
+# Telegram Forwarder Bot — dependencies
+# Tested with Python 3.12.0
+python-telegram-bot==21.6
+Telethon>=1.36.0
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+# Optional but recommended: speeds up Telethon's encryption significantly
+cryptg==0.4.0
