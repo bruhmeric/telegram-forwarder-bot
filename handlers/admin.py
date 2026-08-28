@@ -541,10 +541,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ) as cur:
         await db._conn.commit()
         n = cur.rowcount or 0
-    # Cancel pending album tasks
-    batches = context.chat_data.pop("album_batches", None)
+    # Cancel pending batch tasks (time-based batch window)
+    # Look for both old and new batch keys for backward compatibility
+    batches = context.chat_data.pop("msg_batches", None)
     if batches:
         for batch in batches.values():
+            t = batch.get("task")
+            if t and not t.done():
+                t.cancel()
+    # Legacy key (old album_batches)
+    legacy_batches = context.chat_data.pop("album_batches", None)
+    if legacy_batches:
+        for batch in legacy_batches.values():
             t = batch.get("task")
             if t and not t.done():
                 t.cancel()

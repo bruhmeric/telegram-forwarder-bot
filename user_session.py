@@ -458,7 +458,8 @@ class UserSession:
                             f"(type: {type(msg.media).__name__ if msg.media else 'text'})")
             except Exception as e:
                 last_error = e
-                diag.append(f"✗ Failed to send message {i+1}/{len(messages)}: "
+                diag.append(f"✗ Failed to send message {i+1}/{len(messages)} "
+                            f"via send_message(file=msg.media): "
                             f"{type(e).__name__}: {e}")
 
         if sent_count == len(messages):
@@ -466,6 +467,112 @@ class UserSession:
             return True, diag
         elif sent_count > 0:
             diag.append(f"⚠ Partial success: {sent_count}/{len(messages)} sent")
+            return True, diag
+
+        # ---- Step 3: third fallback — download to disk + send_file ----
+        # The "send_message(file=msg.media)" path fails with
+        # ChatForwardsRestrictedError because Telethon detects that the file
+        # object references an existing message and treats it as a forward.
+        # The only reliable way to send protected content is to:
+        #   1. Download the media bytes to disk (Telethon allows this — you
+        #      have view access as a member)
+        #   2. Upload as a brand new file via send_file(file=path) — no link
+        #      to the protected source, Telegram can't tell it's a "forward"
+        diag.append("⚠ Falling back to download-to-disk + send_file (third path)")
+        diag.append("  → This is slower but works for fully protected content")
+
+        import tempfile
+        import shutil
+        tmp_dir = tempfile.mkdtemp(prefix="forwarder_protected_")
+        try:
+            sent_count = 0
+            for i, msg in enumerate(messages):
+                if not msg.media:
+                    # Text-only message — just send the text
+                    try:
+                        send_kwargs = dict(
+                            message=msg.message or "",
+                            link_preview=False,
+                        )
+                        if topic_id:
+                            from telethon.tl.types import MessageReplyHeader
+                            send_kwargs["reply_to"] = MessageReplyHeader(
+                                reply_to_top_id=topic_id,
+                                reply_to_msg_id=topic_id,
+                            )
+                        if i > 0:
+                            send_kwargs["message"] = ""
+                        await self.client.send_message(dest_entity, **send_kwargs)
+                        sent_count += 1
+                        diag.append(f"✓ Sent text-only message {i+1}/{len(messages)}")
+                    except Exception as e:
+                        diag.append(f"✗ Failed to send text message {i+1}: {type(e).__name__}: {e}")
+                    continue
+
+                # Download media to disk
+                out_path = os.path.join(tmp_dir, f"media_{i}_{int(time.time())}")
+                try:
+                    result = await self.client.download_media(msg, file=out_path)
+                    if not result:
+                        diag.append(f"✗ Could not download media for message {i+1}")
+                        continue
+                    if isinstance(result, bytes):
+                        with open(out_path, "wb") as f:
+                            f.write(result)
+                    else:
+                        out_path = str(result)
+                    sz = os.path.getsize(out_path)
+                    diag.append(f"  • Downloaded media {i+1}/{len(messages)} "
+                                f"({sz/1024/1024:.1f} MB)")
+                except Exception as e:
+                    diag.append(f"✗ Failed to download media {i+1}: {type(e).__name__}: {e}")
+                    continue
+
+                # Determine media type for send_file
+                from telethon.tl import types as tl_types
+                force_document = False
+                if isinstance(msg.media, tl_types.MessageMediaDocument):
+                    doc = msg.media.document
+                    if doc and doc.mime_type:
+                        # Documents that aren't photo/video/audio should be sent as documents
+                        if not (doc.mime_type.startswith("video/") or
+                                doc.mime_type.startswith("audio/") or
+                                doc.mime_type.startswith("image/")):
+                            force_document = True
+
+                # Send the downloaded file as a brand new upload
+                try:
+                    send_kwargs = dict(
+                        file=out_path,
+                        caption=msg.message if i == 0 else "",
+                        formatting_entities=msg.entities if i == 0 else None,
+                        force_document=force_document,
+                    )
+                    if topic_id:
+                        from telethon.tl.types import MessageReplyHeader
+                        send_kwargs["reply_to"] = MessageReplyHeader(
+                            reply_to_top_id=topic_id,
+                            reply_to_msg_id=topic_id,
+                        )
+                    await self.client.send_file(dest_entity, **send_kwargs)
+                    sent_count += 1
+                    diag.append(f"✓ Sent re-uploaded media {i+1}/{len(messages)}")
+                except Exception as e:
+                    diag.append(f"✗ Failed to send re-uploaded media {i+1}: "
+                                f"{type(e).__name__}: {e}")
+                    last_error = e
+        finally:
+            # Cleanup tmp dir
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        if sent_count == len(messages):
+            diag.append(f"✓ All {sent_count} message(s) re-uploaded (third path)")
+            return True, diag
+        elif sent_count > 0:
+            diag.append(f"⚠ Partial success (third path): {sent_count}/{len(messages)} sent")
             return True, diag
         else:
             diag.append(f"✗ All sends failed. Last error: {last_error}")

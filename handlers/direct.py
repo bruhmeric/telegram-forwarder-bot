@@ -24,9 +24,14 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-ALBUM_DEBOUNCE_SECONDS = 3.0  # increased from 1.5 — gives Render / fps.ms
-                              # enough time to deliver all items of an album
-                              # even after a cold start
+ALBUM_DEBOUNCE_SECONDS = 3.0  # kept for backward compat (used by legacy code)
+
+BATCH_WINDOW_SECONDS = 5.0   # NEW: time-based batch window. All messages
+                              # received from a user within this window are
+                              # combined into a SINGLE picker (no flooding).
+                              # If the user keeps sending items, the window
+                              # keeps resetting. The picker only fires after
+                              # the user stops sending for BATCH_WINDOW_SECONDS.
 
 
 # ---------- message classification helpers ----------
@@ -103,11 +108,22 @@ def _extract_media_info(msg) -> dict | None:
 # ---------- main entry ----------
 
 async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any non-command message the admin sends to the bot."""
+    """Handle any non-command message the admin sends to the bot.
+
+    Uses a TIME-BASED BATCH WINDOW: when the user sends multiple messages
+    within BATCH_WINDOW_SECONDS (default 5s), all of them are accumulated
+    into a SINGLE pending forward and the picker is only shown ONCE after
+    they stop sending. This prevents the "flooding" behavior of showing a
+    separate picker for each individual message.
+
+    Previously this only batched messages with the same media_group_id (i.e.
+    true Telegram albums created via multi-select). Now it batches ANY
+    sequence of messages from the same user in the same chat — so if you
+    send 20 separate images, you get ONE picker for all 20, not 20 pickers.
+    """
     if not update.effective_message or not update.effective_user:
         return
     cfg = context.bot_data["config"]
-    db = context.bot_data["db"]
     user_id = update.effective_user.id
 
     if not cfg.is_admin(user_id):
@@ -118,69 +134,76 @@ async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg = update.effective_message
     chat_id = update.effective_chat.id
-    media_group_id = msg.media_group_id
     logger.info("Direct message from %s: %s (media_group=%s)",
-                user_id, _describe(msg), media_group_id)
+                user_id, _describe(msg), msg.media_group_id)
 
-    if media_group_id:
-        await _handle_album_message(update, context, chat_id, user_id, media_group_id, msg)
-        return
-
-    # Single message — create pending and show picker
-    pending_id = await db.create_pending(
-        user_id=user_id,
-        source_chat_id=chat_id,
-        source_message_id=msg.message_id,
-        payload={"kind": "single"},
-        kind="direct",
-    )
-    await _show_picker(update, context, pending_id, label=f"Got it. Pick a topic to forward this to:")
+    # All messages (single, album, or rapid-sequence) go through the same
+    # time-based batch path. The batch window is short enough that a single
+    # message just waits ~5 sec before the picker shows up — which is fine
+    # because the user gets a much smoother experience when sending many.
+    await _handle_batched_message(update, context, chat_id, user_id, msg)
 
 
-async def _handle_album_message(update, context, chat_id, user_id, media_group_id, msg):
-    """Debounce album items, show picker once after accumulation.
+async def _handle_batched_message(update, context, chat_id, user_id, msg):
+    """Time-based batch handler. Accumulates messages from the same chat
+    within BATCH_WINDOW_SECONDS and shows ONE picker for everything once the
+    user stops sending.
 
-    IMPORTANT: we capture the file_id of each item's media (photo/video/etc.)
-    so we can later use send_media_group (the Bot API's actual "send as album"
-    method). The previous approach used copy_message per item, which sends
-    them as separate messages and never groups them as an album — plus it
-    times out for large albums due to Telegram's rate limits.
+    Key behavior:
+      - Every message (single, album item, or rapid-sequence) goes into the
+        same per-chat batch.
+      - When a new message arrives, the batch timer is RESET — so the picker
+        only fires after the user stops sending for BATCH_WINDOW_SECONDS.
+      - All accumulated messages are combined into ONE pending forward and
+        ONE picker (no flooding).
+      - Multi-item batches use the 'album' payload format which uses
+        send_media_group / send_file album to send as a real grouped album.
 
-    We also capture text-only items (no media) and send them separately.
+    This replaces the old _handle_album_message which only batched messages
+    with the same media_group_id (true Telegram albums via multi-select).
     """
     db = context.bot_data["db"]
-    batches = context.chat_data.setdefault("album_batches", {})
-    key = (chat_id, media_group_id)
+    batches = context.chat_data.setdefault("msg_batches", {})
+    key = chat_id  # per-chat, NOT per-media_group_id
     batch = batches.get(key, {
         "user_id": user_id,
         "chat_id": chat_id,
         "media_items": [],   # list of {type, file_id, caption}
-        "text_items": [],    # list of {text} for non-media items in the group
-        "message_ids": [],   # kept for backward compatibility / debugging
+        "text_items": [],    # list of {text, message_id}
+        "message_ids": [],   # source message IDs (for copy_message fallback)
+        "first_update": None,  # first update in batch (for sending picker)
     })
 
     # Always track the message id
     batch["message_ids"].append(msg.message_id)
+
+    # Save the first update so we can send the picker to the right chat
+    if batch["first_update"] is None:
+        batch["first_update"] = update
 
     # Extract media info from this item
     media_info = _extract_media_info(msg)
     if media_info:
         batch["media_items"].append(media_info)
     elif msg.text:
-        # Text-only item in a "media group" — rare but happens for mixed
-        # text+media albums where Telegram splits them
+        # Text-only message — add to text_items
         batch["text_items"].append({"text": msg.text, "message_id": msg.message_id})
 
     batches[key] = batch
 
-    # Cancel previously scheduled picker (debounce)
+    # Cancel previously scheduled picker (debounce) — extends the window
     prev_task = batch.get("task")
     if prev_task and not prev_task.done():
         prev_task.cancel()
 
     async def _later():
         try:
-            await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
+            # Wait BATCH_WINDOW_SECONDS. If another message arrives during
+            # this wait, prev_task.cancel() will fire above and this
+            # coroutine will be cancelled — so a new _later() starts and
+            # extends the window. The picker only fires when the user has
+            # stopped sending for BATCH_WINDOW_SECONDS.
+            await asyncio.sleep(BATCH_WINDOW_SECONDS)
         except asyncio.CancelledError:
             return
         try:
@@ -188,40 +211,53 @@ async def _handle_album_message(update, context, chat_id, user_id, media_group_i
             text_items = batch["text_items"]
             n_media = len(media_items)
             n_text = len(text_items)
-            total = n_media + n_text
+
+            # Always use 'album' payload format (even for 1 item) — this
+            # goes through _forward_album which uses send_media_group for
+            # proper album grouping. For 1 item, send_media_group sends
+            # it as a single message.
+            if n_media >= 1 or n_text >= 1:
+                kind_payload = {
+                    "kind": "album",
+                    "media_items": media_items,
+                    "text_items": text_items,
+                    "message_ids": batch["message_ids"],
+                }
+            else:
+                logger.warning("Empty batch — skipping")
+                batches.pop(key, None)
+                return
 
             # Build a label that reflects what was actually captured
             if n_media and not n_text:
-                # Compact summary like "3 photo, 2 video"
                 type_counts: dict[str, int] = {}
                 for m in media_items:
                     type_counts[m["type"]] = type_counts.get(m["type"], 0) + 1
                 summary = ", ".join(f"{c} {t}" for t, c in type_counts.items())
-                label = f"Album of {n_media} items ({summary}) — pick a topic:"
+                if n_media == 1:
+                    label = f"Got 1 {list(type_counts.keys())[0]} — pick a destination:"
+                else:
+                    label = f"Got {n_media} items ({summary}) — pick a destination:"
             elif n_media and n_text:
-                label = (f"Album of {n_media} media + {n_text} text item(s) "
-                         f"— pick a topic:")
+                label = (f"Got {n_media} media + {n_text} text item(s) "
+                         f"— pick a destination:")
             else:
-                label = f"Album of {n_text} text item(s) — pick a topic:"
+                preview = text_items[0]["text"][:50] if text_items else ""
+                label = f"Got text: \"{preview}...\" — pick a destination:"
 
             pending_id = await db.create_pending(
                 user_id=user_id,
                 source_chat_id=chat_id,
                 source_message_id=batch["message_ids"][0] if batch["message_ids"] else 0,
-                payload={
-                    "kind": "album",
-                    "media_items": media_items,
-                    "text_items": text_items,
-                    "message_ids": batch["message_ids"],  # kept for debugging
-                },
+                payload=kind_payload,
                 kind="direct",
             )
-            # Send a NEW message to the user with the picker (since we can't
-            # reply to the "last" album item cleanly)
-            await _send_picker_new(context, chat_id, pending_id, label=label)
+            # Send a NEW message to the user with the picker
+            first_update = batch["first_update"]
+            await _send_picker_new(context, first_update.effective_chat.id, pending_id, label)
             batches.pop(key, None)
         except Exception:
-            logger.exception("album picker task failed")
+            logger.exception("batch picker task failed")
             batches.pop(key, None)
 
     batch["task"] = asyncio.create_task(_later())
@@ -659,15 +695,17 @@ async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
             topic_id=topic_id,
         )
         if not success:
-            # Build a helpful error message
-            err_lines = "\n".join(diag[-5:])  # last 5 lines (most relevant)
+            # Build a helpful error message — show the last few diagnostic lines
+            err_lines = "\n".join(diag[-7:])  # last 7 lines (most relevant)
             raise RuntimeError(
                 f"Direct send via Telethon failed.\n\n"
                 f"Last diagnostic steps:\n{err_lines}\n\n"
                 f"Likely causes:\n"
                 f"  • Your user account is NOT a member of the destination chat\n"
                 f"  • Your user account was kicked from the source chat\n"
-                f"  • Telethon session expired — re-run python login.py --string"
+                f"  • Telethon session expired — re-run `python login.py --string`\n"
+                f"  • For protected content: all three fallback paths failed "
+                f"(true forward, send_message(file=), download+send_file)"
             )
         # Log full diagnostic
         for line in diag:
