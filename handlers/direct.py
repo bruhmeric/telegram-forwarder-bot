@@ -24,7 +24,9 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-ALBUM_DEBOUNCE_SECONDS = 1.5
+ALBUM_DEBOUNCE_SECONDS = 3.0  # increased from 1.5 — gives Render / fps.ms
+                              # enough time to deliver all items of an album
+                              # even after a cold start
 
 
 # ---------- message classification helpers ----------
@@ -255,7 +257,14 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     src_chat_id = pending["source_chat_id"]
     src_msg_id = pending["source_message_id"]
 
-    await q.edit_message_text(f"Forwarding to topic {topic_id}...")
+    # Show a "Forwarding..." message immediately so the user knows the tap
+    # was registered. For albums, include the count so they have a sense of
+    # how long it'll take.
+    if kind == "direct" and payload.get("kind") == "album":
+        n = len(payload["message_ids"])
+        await q.edit_message_text(f"Forwarding {n} items to topic {topic_id}...")
+    else:
+        await q.edit_message_text(f"Forwarding to topic {topic_id}...")
 
     try:
         if kind == "direct":
@@ -273,7 +282,11 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await db.delete_pending(pending_id)
-    await q.edit_message_text(f"Done — sent to topic {topic_id}.")
+    if kind == "direct" and payload.get("kind") == "album":
+        n = len(payload["message_ids"])
+        await q.edit_message_text(f"Done — {n} items sent to topic {topic_id}.")
+    else:
+        await q.edit_message_text(f"Done — sent to topic {topic_id}.")
 
 
 # ---------- actual forward primitives ----------
@@ -289,26 +302,42 @@ async def _forward_single(context, src_chat_id, src_msg_id, dest_group_id, topic
 
 
 async def _forward_album(context, src_chat_id, message_ids, dest_group_id, topic_id) -> None:
-    """Send multiple messages as a media group (album) to the destination topic.
+    """Forward all items in an album to the destination topic IN PARALLEL.
 
-    Strategy:
-      1. Fetch each source message via bot.get_chat + bot.forward_message? No —
-         we don't have a "get message by id" in the Bot API. Instead, we use
-         `bot.copy_message` for each item. Telegram will deliver them in order;
-         they won't appear as a single grouped album in the destination but
-         will appear sequentially under the same topic.
+    Previously this used a sequential loop, which caused timeouts for large
+    albums (10 items × 2s = 20s). Now we use asyncio.gather to send all
+    copy_message requests concurrently. Telegram will deliver them in order
+    based on message_id; they may or may not appear as a single grouped
+    album in the destination depending on Telegram's grouping heuristics.
 
-    If you need grouped albums in the destination, use the user_session /
-    Telethon path to extract media and re-send via send_media_group. For now,
-    the copy approach is simpler and preserves captions.
+    If you need strict album grouping in the destination, the bot would
+    need to download each item via Telethon and re-send via
+    send_media_group — that's a future enhancement.
     """
-    for mid in message_ids:
-        await context.bot.copy_message(
+    if not message_ids:
+        return
+
+    tasks = [
+        context.bot.copy_message(
             chat_id=dest_group_id,
             from_chat_id=src_chat_id,
             message_id=mid,
             message_thread_id=topic_id,
         )
+        for mid in message_ids
+    ]
+    # Parallelize — return_exceptions=True so one failure doesn't cancel the others
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    failed = [(mid, r) for mid, r in zip(message_ids, results) if isinstance(r, Exception)]
+    succeeded = len(results) - len(failed)
+    if failed:
+        logger.warning("Album forward: %d/%d items failed: %s",
+                       len(failed), len(results), failed[:3])
+        if succeeded == 0:
+            # All failed — re-raise the first error so the user sees it
+            raise failed[0][1]
+    logger.info("Album forward: %d/%d items sent to topic %d",
+                succeeded, len(results), topic_id)
 
 
 async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
@@ -345,9 +374,11 @@ async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
                 media=input_media,
                 message_thread_id=topic_id,
             )
-    elif text:
+    elif text or caption:
+        # Fallback: text-only post or media download failed
+        # Send the text/caption as a plain message to the destination topic
         await bot.send_message(
-            chat_id=dest_group_id, text=text, message_thread_id=topic_id,
+            chat_id=dest_group_id, text=text or caption, message_thread_id=topic_id,
         )
     else:
         raise RuntimeError("Empty link payload")

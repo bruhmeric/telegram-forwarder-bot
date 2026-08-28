@@ -98,12 +98,36 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         media_path = await _download_media(user_session, m, tmp_dir, idx)
         if media_path:
             media_paths.append(media_path)
-        elif not messages_to_handle and m.message:
+        elif m.message and not media_paths:
+            # Bug fix: previously the condition was `elif not messages_to_handle
+            # and m.message:` — but `messages_to_handle` is always truthy
+            # (it's at least `[msg]`), so this branch was dead code and
+            # `text_only` was never set. As a result, text-only posts in
+            # locked channels were forwarded with `media_paths=[]` and
+            # `text=None`, which triggered "Empty link payload" in
+            # _forward_link.
+            #
+            # Fix: only set text_only if we haven't successfully downloaded
+            # any media yet. For albums, the first media item's caption
+            # wins.
             text_only = m.message
 
     if not media_paths and not text_only and not caption:
         await status.edit_text("That message has no viewable content.")
         return
+
+    # Show diagnostic info so the user knows if media was actually downloaded
+    if not media_paths and (text_only or caption):
+        # text-only post — no media to forward
+        pass
+    elif not media_paths:
+        # We expected media but got none — downloads failed silently
+        await status.edit_text(
+            "Could not download media from that post. The bot's user account "
+            "may not have access to the file, or the file is too large "
+            "(>50MB Bot API limit). Falling back to text only."
+        )
+        # Continue and let _forward_link send the text fallback
 
     payload = {
         "media_paths": media_paths,
@@ -143,8 +167,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     keyboard = topics_mgr.build_keyboard(pending_id, topics)
     n = len(media_paths)
-    label = (f"Fetched {n} media item(s)" if media_paths else "Fetched text message")
-    label += " — pick a topic:"
+    if n == 1:
+        m = media_paths[0]
+        # Show media type so the user knows what's about to be sent
+        label = f"Fetched 1 {m['type']} — pick a topic:"
+    elif n > 1:
+        types = [m["type"] for m in media_paths]
+        # Compact summary like "2 photo, 1 video"
+        type_counts: dict[str, int] = {}
+        for t in types:
+            type_counts[t] = type_counts.get(t, 0) + 1
+        summary = ", ".join(f"{c} {t}" for t, c in type_counts.items())
+        label = f"Fetched {n} items ({summary}) — pick a topic:"
+    else:
+        # No media — will be sent as text
+        text_preview = (text_only or caption or "")[:50]
+        if text_preview:
+            label = f"Fetched text only (no media): \"{text_preview}...\" — pick a topic:"
+        else:
+            label = "Fetched text message — pick a topic:"
     await status.edit_text(label, reply_markup=keyboard)
 
 
