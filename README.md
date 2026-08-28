@@ -1,30 +1,42 @@
 # Telegram Forwarder Bot
 
-A self-hosted Telegram bot that forwards whatever you send it to a chosen topic (forum thread) inside a destination group. Supports pulling content from locked / private channels via your personal Telegram account session (Telethon).
+A self-hosted Telegram bot that forwards whatever you send it to a chosen topic (forum thread) or regular chat. Supports pulling content from locked / private channels via your personal Telegram account session (Telethon), **auto-scraping entire channels**, and sending directly to Saved Messages for the fastest path.
 
 ## Features
 
 | Feature | How |
 |---|---|
-| Forward text / photo / video / file / album | Send to bot -> tap a topic button |
-| Auto-discover forum topics | `/refresh` enumerates via Telethon `GetForumTopics` |
-| Manual topic override | `/addtopic <title> <id>` |
-| Pull from a locked private channel | Send a `t.me/c/<id>/<msg_id>` link |
-| Pull from a public channel | Send a `t.me/<channelname>/<msg_id>` link |
-| Persistent state | SQLite (`forwarder.db`) |
-| Admin whitelist | Optional `ADMIN_IDS` in `.env` |
-| **Deploy to Render free tier** | Webhook mode + `StringSession` |
+| **Direct forward** of text / photo / video / file / album | Send to bot → tap a topic button (or single Forward button for non-forum) |
+| **Time-based batch** for multiple messages | Send many photos rapidly → bot waits 5s, shows ONE picker for everything |
+| **Pull from locked private channels** | Send a `t.me/c/<id>/<msg_id>` link — bot uses Telethon to fetch and re-upload |
+| **Pull from public channels** | Send a `t.me/<channelname>/<msg_id>` link |
+| **Auto-scrape entire channels** | `/scrape <url> [flags]` — bot iterates ALL messages and sends media in parallel |
+| **Media type filters** | `/scrape <url> photo video` — only photos and videos; `/scrape <url> docs audio` — only docs and audio |
+| **Direct to Saved Messages** | `/saved <url>` — skip the picker, fastest path |
+| **Live progress display** | Bot edits the status message during download/upload with % complete and MB transferred |
+| **Streamable video uploads** | Videos re-uploaded with `supports_streaming=True`, original thumbnail, duration, dimensions |
+| **Three-tier protected-content fallback** | true forward → send_message(file=) → download + send_file (works on noforwards channels) |
+| **Auto-discover forum topics** | `/refresh` enumerates via Telethon `GetForumTopics` |
+| **Manual topic override** | `/addtopic <title> <id>` |
+| **Non-forum destinations** | Bot auto-detects via `get_chat().is_forum` and shows single Forward button instead of topic picker |
+| **Persistent state** | SQLite (`forwarder.db`) |
+| **Admin whitelist** | Optional `ADMIN_IDS` in `.env` |
+| **Concurrent update processing** | Multiple links / messages handled in parallel (no queue-blocked updates) |
+| **Webhook + polling modes** | Webhook for Render/fps.ms, polling for local dev |
+| **StringSession** | No `.session` file needed on ephemeral filesystems (Render) |
+| **Deploy to Render free tier** | `render.yaml` Blueprint included |
 
-The bot re-uploads media from locked channels (it does NOT use Telegram's forward feature) — this works even when the source channel has "forwarding / saving restricted" enabled, because your **personal account** can still view the content and the bot re-uploads the bytes through your user session's download.
+The bot re-uploads media from locked channels (it does NOT use Telegram's native forward feature) — this works even when the source channel has "forwarding / saving restricted" enabled, because your **personal account** can still view the content and the bot re-uploads the bytes through your user session's download.
 
 ---
 
-## Quick start (two paths)
+## Quick start (three paths)
 
 | If you want to... | Follow... |
 |---|---|
 | Run it on your own machine or VPS | [Local setup](#local-setup) |
 | Deploy to Render.com free tier | [Render setup](#render-setup) |
+| Just see all the commands | [Commands](#commands) |
 
 ---
 
@@ -35,7 +47,7 @@ The bot re-uploads media from locked channels (it does NOT use Telegram's forwar
 - Python 3.10 or newer
 - A Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather), copy the token
 - Telegram API credentials — get `API_ID` and `API_HASH` from <https://my.telegram.org/apps> (sign in -> "API development tools")
-- A destination group that is a **forum** (topics enabled). The bot must be a member with "Send Messages" permission. Your personal Telegram account must also be a member (so Telethon can enumerate topics).
+- A destination chat (group or channel, forum or non-forum). The bot must be a member with "Send Messages" permission. Your personal Telegram account must also be a member (for Telethon-based features).
 
 ### 2. Install
 
@@ -58,22 +70,20 @@ Edit `.env`:
 | `API_ID` | From my.telegram.org |
 | `API_HASH` | From my.telegram.org |
 | `PHONE` | Your phone (used only by `login.py`) |
-| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` (see below) |
+| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` (optional for `/saved` and `/scrape saved`) |
 | `ADMIN_IDS` | Comma-separated Telegram user IDs (optional but recommended) |
 
 ### 3. One-time Telethon login
 
 ```bash
-python login.py
+python login.py            # file-based session (local dev)
+# OR
+python login.py --string   # StringSession (recommended for Render)
 ```
 
 You'll be prompted for:
 - A confirmation code sent to your Telegram
 - (Optional) 2FA password if your account has it
-
-This creates `user_session.session` — a saved login for **your personal Telegram account**. The bot uses it to:
-- Enumerate forum topics in your destination group
-- Read messages from locked/private channels you are a member of
 
 ### 4. Add the bot to the destination group
 
@@ -92,9 +102,10 @@ python bot.py
 In a private chat with the bot:
 
 ```
-/setgroup -1001234567890
-/refresh
-/topics        # confirm topics were discovered
+/setgroup -1001234567890      # set destination (optional for /saved, /scrape saved)
+/info                         # see chat info — is it a forum? title?
+/refresh                      # discover topics (forum only)
+/topics                       # confirm topics were discovered
 ```
 
 If `/refresh` fails (e.g. because your account isn't a member of the group), you can add topics manually:
@@ -106,189 +117,28 @@ If `/refresh` fails (e.g. because your account isn't a member of the group), you
 
 ### 7. Using the bot
 
-**Direct forward** — send anything to the bot in a private chat. It will reply with inline buttons showing the available topics. Tap one to forward.
+**Direct forward** — send anything to the bot. The bot waits 5 seconds (in case you send more items), then shows a single picker with everything. Tap a topic (or the "Forward to <chat>" button for non-forum destinations).
 
-**Locked-channel forward** — paste a link to the message you want:
-
+**Locked-channel forward** — paste a link to a single message:
 ```
 https://t.me/c/1234567890/42
 https://t.me/privatechannelname/42
 ```
+The bot fetches via your Telethon session, then shows the picker.
 
-The bot fetches via your Telethon session, downloads media to a temp dir, and shows the topic picker. After you tap a topic, it re-uploads via the Bot API.
-
----
-
-## Render setup
-
-Render's free tier is ideal for a personal bot. The free plan has these caveats — read them so you know what to expect:
-
-- **The service sleeps after 15 min of no inbound HTTP requests.** When someone sends the bot a message, Telegram hits the webhook URL, Render wakes the service (30-60 sec cold start), and Telegram retries. The first message after a long idle period will be slow; subsequent ones are instant.
-- **Ephemeral filesystem** — files don't persist across restarts. That's why we use `StringSession` (stored in an env var) instead of a `.session` file.
-- **512 MB RAM, 0.1 CPU** — plenty for this bot.
-- **750 free instance-hours per month** — enough for ~31 days of 24/7 (with sleep, much less is actually used).
-
-To keep the service awake 24/7, see [Keep the service awake (optional)](#keep-the-service-awake-optional) below.
-
-### Step 1. Push the project to GitHub
-
-The simplest path:
-
-```bash
-# On your local machine:
-cd telegram-forwarder-bot
-git init
-git add .
-git commit -m "Initial commit: Telegram Forwarder Bot"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo>.git
-git push -u origin main
+**Direct to Saved Messages** (fast path):
 ```
-
-Make sure `.gitignore` is honored (it is by default — it excludes `.env`, `*.session`, `forwarder.db`).
-
-### Step 2. Get your Telegram credentials ready
-
-Before deploying, have these values on hand:
-
-| Value | Where to get it |
-|---|---|
-| `BOT_TOKEN` | [@BotFather](https://t.me/BotFather) -> create a bot -> copy the token |
-| `API_ID` | <https://my.telegram.org/apps> -> "API development tools" |
-| `API_HASH` | Same place as `API_ID` |
-| `SESSION_STRING` | Generate locally — see **Step 3** below |
-| `DESTINATION_GROUP_ID` | Add [@RawDataBot](https://t.me/RawDataBot) to your group, copy the chat_id it prints, then remove it |
-| `ADMIN_IDS` | Your Telegram user ID from [@userinfobot](https://t.me/userinfobot) |
-
-### Step 3. Generate the SESSION_STRING locally
-
-You need to do this **once**, on your local machine. The output string is what Render will use as the Telethon session — no `.session` file needed on the server.
-
-```bash
-# On your local machine, inside the project directory:
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Edit .env: fill in API_ID, API_HASH, PHONE (other vars don't matter for this step)
-
-python login.py --string
+/saved https://t.me/c/1234567890/42
 ```
+Skips the picker entirely — content goes straight to Saved Messages.
 
-You'll be prompted for the SMS code (and 2FA password if you have one). After successful login, the script prints:
-
+**Auto-scrape entire channel**:
 ```
-======================================================================
-  SESSION_STRING (copy this ENTIRE line, including '1' prefix):
-
-  1BVtsOH8Bu5T2nTRrQzQzF1kT3FvYzBEXAMPLE...long_string...
-
-======================================================================
+/scrape https://t.me/somechannel
+/scrape https://t.me/c/1234567890 saved old
+/scrape https://t.me/c/1234567890 photo video parallel=5
 ```
-
-**Copy that entire string** (including the leading `1`). Save it somewhere safe — it grants full access to your Telegram account.
-
-### Step 4. Deploy to Render
-
-Two ways to deploy:
-
-#### Option A. Blueprint (recommended — uses `render.yaml`)
-
-1. Go to <https://dashboard.render.com> -> **New** -> **Blueprint**
-2. Select your GitHub repo. Render reads `render.yaml` and creates the service automatically.
-3. Click **Apply**. Render creates a free Web Service named `telegram-forwarder-bot`.
-
-#### Option B. Manual
-
-1. Go to <https://dashboard.render.com> -> **New** -> **Web Service**
-2. Connect your GitHub account and select your repo
-3. Configure:
-   - **Name:** `telegram-forwarder-bot` (or whatever you want)
-   - **Region:** closest to you
-   - **Runtime:** Python 3
-   - **Build command:** `pip install -r requirements.txt`
-   - **Start command:** `python bot.py`
-   - **Plan:** Free
-4. Click **Create Web Service**
-
-### Step 5. Set environment variables in Render
-
-After the service is created (the first deploy will likely FAIL — that's OK, see below):
-
-1. In Render, open your service -> **Environment** (left sidebar)
-2. Add the following environment variables:
-
-| Key | Value | Required |
-|---|---|---|
-| `MODE` | `webhook` | Yes — set this FIRST |
-| `BOT_TOKEN` | your bot token from @BotFather | Yes |
-| `API_ID` | your API ID from my.telegram.org | Yes (for locked channels) |
-| `API_HASH` | your API hash from my.telegram.org | Yes (for locked channels) |
-| `SESSION_STRING` | the long string from `python login.py --string` | Yes (for locked channels) |
-| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` | Yes |
-| `ADMIN_IDS` | e.g. `123456789` | Recommended |
-| `WEBHOOK_URL` | `https://<your-service-name>.onrender.com` | Yes — see Step 6 |
-| `DB_PATH` | `/tmp/forwarder.db` | Optional (defaults to this on Render) |
-
-3. Click **Save Changes**. Render redeploys automatically.
-
-### Step 6. Set the WEBHOOK_URL (after the first deploy)
-
-You can only know your service's public URL **after the first deploy**. Here's the workflow:
-
-1. **First deploy** — the service builds and starts, but the bot will log `MODE=webhook but WEBHOOK_URL is not set!` and Telegram cannot reach it yet. That's expected.
-2. In Render, open your service. At the top of the page, you'll see the URL, e.g. `https://telegram-forwarder-bot-xyz.onrender.com`.
-3. Copy that URL. Go to **Environment** -> add or update `WEBHOOK_URL` with this value (no trailing slash):
-   ```
-   https://telegram-forwarder-bot-xyz.onrender.com
-   ```
-4. Click **Save Changes**. Render redeploys. On startup, the bot calls `setWebhook` on Telegram, registering `https://your-service.onrender.com/<bot-token-secret>` as the webhook URL.
-5. Verify in Render logs that you see:
-   ```
-   Webhook URL: https://telegram-forwarder-bot-xyz.onrender.com/ABC-DEF...
-   Bot started: @your_bot (123456789) mode=webhook
-   ```
-
-### Step 7. Configure the bot
-
-In a private chat with the bot (on Telegram):
-
-```
-/setgroup -1001234567890
-/refresh
-/topics
-/status
-```
-
-`/status` should report:
-- Telethon user session: connected
-- Destination group: <your group id>
-- Known topics: N
-- Admin whitelist: 1 user(s)
-
-### Step 8. Test it
-
-Send the bot a photo. It should reply with inline buttons for each topic. Tap one — the photo gets forwarded to that topic in your group.
-
-Send the bot a `t.me/c/<id>/<msg>` link from a locked channel. It should fetch the content via your Telethon session and offer the topic picker.
-
-### Keep the service awake (optional)
-
-Render's free tier sleeps the service after 15 min of inactivity. When asleep:
-- The first message after the idle period takes 30-60 sec (Render cold start)
-- Subsequent messages are instant
-
-If you want 24/7 responsiveness without paying, set up a free [UptimeRobot](https://uptimerobot.com) monitor:
-
-1. Sign up at <https://uptimerobot.com> (free plan: 50 monitors, 5-min checks)
-2. Add a new monitor:
-   - Type: HTTP(s)
-   - URL: `https://your-service-name.onrender.com/` (or any path — the webhook server returns 404 on unknown paths, which UptimeRobot considers "up")
-   - Interval: 5 minutes
-3. Save. UptimeRobot will ping your service every 5 min, keeping it awake.
-
-**Note:** This counts toward Render's 750 free instance-hours per month. With a 5-min ping, the service stays awake 24/7, using ~720 hours/month — under the limit. If you skip the ping, the service sleeps but you'll see a 30-60 sec delay on the first message after each 15-min idle period.
+Iterates ALL messages in the channel and sends media in parallel. See [Scraping](#scraping) below.
 
 ---
 
@@ -298,91 +148,332 @@ If you want 24/7 responsiveness without paying, set up a free [UptimeRobot](http
 |---|---|
 | `/start` | Show the intro message |
 | `/help` | Show the help message |
-| `/setgroup <id>` | Set the destination group |
-| `/refresh` | Re-fetch forum topics via Telethon |
-| `/topics` | List known topics |
-| `/addtopic <title> <id>` | Add a topic manually |
+| `/setgroup <id>` | Set the destination group/channel (forum or non-forum) |
+| `/info` | Show destination chat info (is it a forum? title? member count?) |
+| `/refresh` | Re-fetch forum topics via Telethon (forum only) |
+| `/topics` | List known topics (forum only) |
+| `/addtopic <title> <id>` | Add a topic manually (forum only) |
 | `/deltopic <id>` | Remove a manually-added topic |
 | `/status` | Show bot status (Telethon, group, topics, admins) |
+| `/whoami` | Show your Telegram user ID + admin status |
+| `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
+| `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
+| `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
+| `/stop_scrape` | 🛑 stop the active scrape |
+| `/scrape_status` | 📊 check scrape progress |
+| `/caption <text>` | 📝 set a custom caption (replaces original on all forwards) |
+| `/caption strip` | 📝 strip ALL captions from forwarded media |
+| `/caption clear` | 📝 restore original caption behavior |
 | `/cancel` | Cancel any pending forward for this chat |
 
-## Troubleshooting
+---
 
-### On Render
+## Captions
 
-**The first deploy fails with "MODE=webhook requires WEBHOOK_URL"**
-That's expected — you can only know the URL after the first deploy. Set `WEBHOOK_URL` in Render's Environment tab and redeploy.
+By default, the bot preserves original captions when forwarding. You can change this:
 
-**Logs show `Telethon session unavailable`**
-`SESSION_STRING` is missing or invalid. Generate it locally with `python login.py --string` and paste the entire printed string into Render's `SESSION_STRING` env var. The string starts with `1` — include that.
+### `/caption <text>` — set a custom caption
 
-**Logs show `MODE=webhook but WEBHOOK_URL is not set!`**
-You didn't set `WEBHOOK_URL` in Render's Environment tab. Set it to `https://your-service-name.onrender.com` (no trailing slash).
+```
+/caption Check out this content!
+```
 
-**Bot doesn't respond after a long idle period**
-Render free tier sleeps the service after 15 min of no inbound HTTP. The first message after sleep takes 30-60 sec. See [Keep the service awake](#keep-the-service-awake-optional) to prevent this.
+All forwarded media (via `/scrape`, `/saved`, or sending a link) will use this caption instead of the original. Truncated to Telegram's 1024-char limit.
 
-**`/refresh` returns "Telethon user session not available"**
-Your `SESSION_STRING` is invalid or expired. Re-run `python login.py --string` locally and update the env var in Render.
+### `/caption strip` — strip all captions
 
-### Local
+```
+/caption strip
+```
 
-**`Telethon user session not available` after starting the bot**
-Run `python login.py` first. The session file `user_session.session` must exist.
+Forwards media WITHOUT any caption. Useful when you don't want the source's captions polluting your destination.
 
-**`/refresh` returns "No topics found"**
-- Confirm your **personal account** is a member of the destination group (not just the bot)
-- Confirm the group is a forum (topics enabled)
-- Use `/addtopic <title> <id>` to add topics manually as a fallback
+### `/caption clear` — restore original captions
 
-**Bot can't send to the destination group**
-Make sure the bot is a member of the group and "Send Messages" is enabled in its permissions.
+```
+/caption clear
+```
 
-**Locked-channel link returns "Couldn't fetch that message"**
-- Your personal account must be a member of that channel
-- The link must point to a real post (try opening it in Telegram — if you can't open it, neither can Telethon)
-- If the channel uses a custom domain / private invite link (`t.me/+abc...`), the bot can't auto-resolve it — you need a direct post link (`t.me/c/<id>/<msg>` or `t.me/<username>/<msg>`)
+Returns to the default behavior: forwards use the original caption from the source.
 
-**Forwarding an album — items appear as separate messages in the destination**
-This is a current limitation of using `copy_message` per item. To preserve album grouping, the bot would need to extract media and re-send via `send_media_group`. For now, captions are preserved on the first item.
+### `/caption` (no args) — show current setting
+
+```
+/caption
+```
+
+Shows the current caption mode and a preview of the text if set.
+
+### How it works
+
+When a custom caption is set:
+- **`/scrape`** — every forwarded media item gets your custom caption (no original captions)
+- **`/saved <url>`** — the saved message gets your custom caption
+- **Direct link forward** — the picked topic/chat receives media with your custom caption
+- **Direct message forward** (send photos to bot → tap topic) — same: custom caption applied
+
+The caption is applied to the **first item** of an album only (Telegram albums only show one caption). For single media, the custom caption is used directly.
+
+When set to "strip" (empty string), no captions are sent at all. Text-only messages from the source are skipped entirely.
+
+When set to "clear" (None), original captions are preserved (legacy behavior).
+
+---
+
+## Scraping
+
+`/scrape <url> [flags]` is the most powerful command — it iterates all messages in a channel and forwards each media message to your destination.
+
+### Syntax
+
+```
+/scrape <channel_url> [flags]
+```
+
+### Flags (any combination)
+
+| Flag | Effect |
+|---|---|
+| `old` | Oldest first (chronological order). Default: newest first. |
+| `saved` | Send to Saved Messages. Default: destination group. |
+| `photo` / `photos` | Only photos |
+| `video` / `videos` | Only videos |
+| `doc` / `docs` | Only documents |
+| `audio` | Only audio |
+| `voice` | Only voice messages |
+| `animation` | Only animations (GIFs) |
+| `parallel=N` | Set parallel send count (default 3, max 10) |
+
+If no media type filter is specified, ALL media is forwarded.
+
+### Examples
+
+```
+/scrape https://t.me/publicchannel
+/scrape https://t.me/c/1234567890
+/scrape https://t.me/c/1234567890 saved old
+/scrape https://t.me/c/1234567890 photo video         # only photos + videos
+/scrape https://t.me/c/1234567890 saved old videos parallel=5  # all options
+```
+
+### How it works
+
+1. **Parses** the channel URL (`t.me/c/<id>` or `t.me/<username>`)
+2. **Resolves the channel** via Telethon (confirms your user account is a member)
+3. **Iterates all messages** with `client.iter_messages` (memory-efficient — doesn't load everything at once)
+4. **For each message with media**:
+   - Classifies the media type (photo, video, animation, document, audio, voice)
+   - Applies your filter (if any)
+   - Sends via the **same three-tier fallback** as `/saved`:
+     1. Try `forward_messages` (fastest, works for non-protected)
+     2. Fall back to `send_message(file=msg.media)` (works for some protected)
+     3. Final fallback: download + re-upload with `send_file` (works for fully-protected, preserves thumbnail, streaming, duration, dimensions)
+   - **Skips text-only messages** and non-downloadable types (web pages, contacts, geos, polls)
+5. **Rate limiting**: 0.3 sec delay per parallel slot + automatic FloodWait handling
+6. **Status updates**: edits the status message every 5 sec with progress (sent/failed/skipped counts)
+7. **Cancellation**: check between each message; `/stop_scrape` stops cleanly (waits for in-flight sends)
+
+### Example session
+
+```
+You: /scrape https://t.me/somechannel saved old videos parallel=5
+
+Bot: 🔍 Starting scrape...
+     Source: somechannel
+     Destination: Saved Messages
+     Order: oldest first
+     Filter: only: video
+     Parallel: 5 sends
+
+     Use /stop_scrape to cancel, /scrape_status to check progress.
+
+[5 sec later]
+Bot: [edits same message]
+     📊 Scraping in progress...
+     Total seen: 47
+     Sent: 23
+     Failed: 0
+     Skipped (filtered/no media): 24
+     Last msg ID: 1042
+     Parallel sends: 5
+
+You: /stop_scrape
+Bot: 🛑 Stop signal sent...
+
+Bot: [final status]
+     🛑 Scraping cancelled by user.
+        Sent: 156, Failed: 2, Skipped: 89
+```
+
+### Speed tuning
+
+- **Default: `parallel=3`** — safe, ~9 msgs/sec total (3 slots × 3 msgs/sec each)
+- **`parallel=5`** — ~15 msgs/sec, may hit FloodWait occasionally
+- **`parallel=10`** (max) — ~30 msgs/sec, will likely hit FloodWait often; bot handles it automatically by sleeping and retrying
+
+If you hit FloodWait frequently, lower the parallel count.
+
+### Notes
+
+- Your user account must be a member of the source channel
+- Your user account must be a member of the destination chat (or use `saved` for Saved Messages)
+- The scrape runs in the background — you can use other bot commands meanwhile
+- Only one scrape at a time — the second `/scrape` will be rejected
+- If Render sleeps the service mid-scrape, the task is lost (not persisted). Re-run `/scrape` to continue.
+- For huge channels (10000+ posts), expect it to take hours at the safe rate
+
+---
+
+## /saved — fast path to Saved Messages
+
+`/saved <url>` skips the topic picker entirely and sends content directly to your Saved Messages via Telethon. This is the fastest path because:
+- No topic picker (instant, no waiting for user input)
+- No topic thread (simpler API call)
+- Your account is always a member of Saved Messages
+
+```
+/saved https://t.me/c/1234567890/42
+```
+
+Live progress is shown during download/upload (with % complete and MB transferred). Then `✅ Sent to Saved Messages!`
+
+The same three-tier fallback applies: true forward → send_message(file=) → download + send_file.
+
+---
+
+## How protected content (noforwards) works
+
+When a channel has "Save / Forward" disabled by the admin:
+
+1. **Try `forward_messages`** — Telegram blocks this with `ChatForwardsRestrictedError`
+2. **Try `send_message(file=msg.media)`** — also blocked (Telethon detects the reference to a protected message)
+3. **Download to disk + `send_file(file=path)`** — this works:
+   - Downloads the bytes (your account has view access as a member)
+   - Re-uploads as a brand new file with no link to the protected source
+   - Preserves: original attributes (DocumentAttributeVideo with duration, w, h), `supports_streaming=True`, mime_type, original filename
+   - Downloads the **thumbnail** separately and attaches it as the video poster
+   - Uses **512KB chunk size** for download and upload (4x faster than Telethon's auto-picker)
+
+---
+
+## Render setup
+
+See [Render setup (in original README)](#render-setup-details) below for the full step-by-step.
+
+### Quick start
+
+1. Push the project to GitHub (unzip `telegram-forwarder-bot.zip`, `git init`, push)
+2. Generate SESSION_STRING locally:
+   ```bash
+   pip install -r requirements.txt
+   cp .env.example .env  # fill in API_ID, API_HASH, PHONE
+   python login.py --string
+   # Copy the printed SESSION_STRING
+   ```
+3. Render Dashboard → New → Blueprint → select your repo → Apply
+4. First deploy will fail (no WEBHOOK_URL yet). Note your service URL: `https://telegram-forwarder-bot-xyz.onrender.com`
+5. Set env vars in Render (Environment tab):
+   - `MODE=webhook`
+   - `BOT_TOKEN`, `API_ID`, `API_HASH`, `SESSION_STRING`, `DESTINATION_GROUP_ID`, `ADMIN_IDS`
+   - `WEBHOOK_URL=https://telegram-forwarder-bot-xyz.onrender.com`
+   - `DB_PATH=/tmp/forwarder.db`
+6. Save → Render redeploys. Logs should show `Bot started: @your_bot mode=webhook`
+7. Send `/start`, `/whoami`, `/status` to verify
+8. (Optional) Set up UptimeRobot to keep Render awake (free tier sleeps after 15 min)
+
+<a id="render-setup-details"></a>
+
+### Render Blueprint (`render.yaml`)
+
+The repo includes `render.yaml` for one-click deploy:
+
+```yaml
+services:
+  - type: web
+    name: telegram-forwarder-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    envVars:
+      - key: MODE
+        value: webhook
+      # ... (BOT_TOKEN, API_ID, etc. set in dashboard)
+```
+
+---
 
 ## File layout
 
 ```
 telegram-forwarder-bot/
-├── bot.py                # main entry point (supports polling + webhook)
+├── bot.py                # main entry (webhook + polling modes, concurrent updates)
 ├── login.py              # one-time Telethon login (--string for Render)
 ├── config.py             # env loader
 ├── db.py                 # SQLite layer
-├── user_session.py       # Telethon manager + link parser (file or StringSession)
+├── user_session.py       # Telethon manager + link parser + scrape_channel
 ├── topics.py             # forum topic discovery + inline keyboard
 ├── handlers/
 │   ├── __init__.py
-│   ├── admin.py          # /setgroup, /refresh, /status, etc.
-│   ├── direct.py         # direct forward flow + callback dispatcher
-│   └── link.py           # locked-channel URL -> fetch & forward flow
-├── render.yaml           # Render Blueprint (for one-click deploy)
-├── .python-version       # pins Python 3.12.0 for Render
+│   ├── admin.py          # /setgroup, /scrape, /saved, /info, /test_link, etc.
+│   ├── direct.py         # direct forward + time-based batch window
+│   └── link.py           # locked-channel URL → fetch + forward
+├── render.yaml           # Render Blueprint
+├── .python-version       # pins Python 3.12.0
 ├── requirements.txt
-├── run.sh                # convenience launcher for local dev
+├── run.sh                # convenience launcher
 ├── .env.example
 ├── .gitignore
 └── README.md
 ```
 
+---
+
+## Troubleshooting
+
+### `/start` doesn't respond
+
+- Check Render logs for `📨 Incoming update_id=...` — if absent, Telegram isn't reaching your webhook
+- Check `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — `url` should match your Render URL
+- If `pending_update_count > 0` and `last_error_message="Read timeout expired"` — Render is asleep. Set up UptimeRobot (5-min pings) or move to fps.ms (never sleeps).
+- If `ADMIN_IDS` is set but doesn't include your user ID, all commands silently fail. Send `/whoami` (always responds) to see your ID.
+
+### Locked-channel link fails
+
+- Send `/test_link <url>` — the bot shows a step-by-step diagnostic of where it failed
+- Most common: your user account is not a member of the source channel → `ChannelPrivateError`
+- If you see `ChatForwardsRestrictedError` → the bot should fall through to the third-tier fallback (download + re-upload). If it doesn't, send the diagnostic to me.
+
+### Scraping is slow
+
+- Default `parallel=3` is conservative. Try `parallel=5` or `parallel=10` to go faster.
+- If you hit FloodWait often (you'll see `⏳ Flood wait` in the status), lower the parallel count.
+- For huge channels, scraping will take hours at any safe rate. Run it overnight.
+
+### Videos sent as documents (no streaming, no thumbnail)
+
+- The bot preserves `DocumentAttributeVideo`, mime_type, and `supports_streaming=True`
+- If the source video has a thumbnail, the bot downloads and attaches it
+- If you see `(no thumbnail)` in the diagnostic, the source had no embedded thumb — Telegram will generate one from the video itself
+
+---
+
 ## Security checklist
 
-- [ ] Keep `user_session.session` (local) and `SESSION_STRING` (Render) private — both grant full access to your account
+- [ ] Keep `SESSION_STRING` private — grants full access to your Telegram account
 - [ ] Set `ADMIN_IDS` so only you can use the bot
-- [ ] Don't commit `.env` or `*.session` to git — `.gitignore` already covers them
+- [ ] Don't commit `.env` or `*.session` to git (`.gitignore` covers them)
 - [ ] Use a strong, unique password on the Telegram account whose session you're using
+
+---
 
 ## Roadmap (not implemented)
 
-- Auto-mirror mode (monitor a channel and forward everything new)
+- Persistent scrape state (survive Render restarts)
+- Topic-aware scraping (send to a specific topic, not just chat-level)
 - Caption editing / stripping
-- Retry queue for failed forwards
-- Custom keyboard column count per topic list length
-- Persistent SQLite on Render (would require a paid disk)
+- Retry queue for failed sends
+- Auto-resume on bot restart
 
 These can be added on request.

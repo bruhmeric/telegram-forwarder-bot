@@ -620,9 +620,18 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
 
     # Send album items in chunks of 10 (Telegram max per send_media_group)
     if album_items:
-        # Use the first item's caption as the album caption (Telegram only
-        # shows the caption of the first item in a media group).
-        first_caption = album_items[0].get("caption") if album_items else None
+        # Apply the custom_caption policy:
+        # - custom_caption=None: use original caption (first item's)
+        # - custom_caption="" (strip): no caption
+        # - custom_caption="<text>": use this text
+        from handlers.admin import _get_custom_caption
+        custom_caption = await _get_custom_caption(context)
+        if custom_caption is None:
+            first_caption = album_items[0].get("caption") if album_items else None
+        elif custom_caption == "":
+            first_caption = None  # strip mode
+        else:
+            first_caption = custom_caption
 
         for chunk_start in range(0, len(album_items), 10):
             chunk = album_items[chunk_start:chunk_start + 10]
@@ -657,9 +666,24 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
                 failed.append((chunk, e))
 
     # Send other items (documents, audio) individually
+    # NOTE: custom_caption was already loaded above in the album_items branch.
+    # If album_items was empty, we need to load it now. We use a simple
+    # sentinel: if custom_caption is not in locals(), load it.
+    try:
+        _ = custom_caption  # check if defined
+    except NameError:
+        from handlers.admin import _get_custom_caption
+        custom_caption = await _get_custom_caption(context)
+
     for item in other_items:
         try:
-            cap = item.get("caption")
+            # Determine caption: use custom_caption policy
+            if custom_caption is None:
+                cap = item.get("caption")
+            elif custom_caption == "":
+                cap = None  # strip
+            else:
+                cap = custom_caption
             if item["type"] == "document":
                 await context.bot.send_document(
                     chat_id=dest_group_id,
@@ -680,17 +704,34 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
             failed.append(([item], e))
 
     # Send text items as separate messages
-    for item in text_items:
+    # If custom_caption is "" (strip) or a string, skip sending text items
+    # entirely — they were text captions from the source, not user content.
+    if custom_caption is None:
+        for item in text_items:
+            try:
+                await context.bot.send_message(
+                    chat_id=dest_group_id,
+                    text=item["text"],
+                    **_thread_kwargs(topic_id),
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.warning("send_message (text item) failed: %s", e)
+                failed.append(([item], e))
+    # If custom_caption is a non-empty string, send it ONCE as a separate text
+    # message (only if there are text items — otherwise the caption is on the
+    # media already).
+    elif custom_caption and text_items:
         try:
             await context.bot.send_message(
                 chat_id=dest_group_id,
-                text=item["text"],
+                text=custom_caption,
                 **_thread_kwargs(topic_id),
             )
             sent_count += 1
         except Exception as e:
-            logger.warning("send_message (text item) failed: %s", e)
-            failed.append(([item], e))
+            logger.warning("send_message (custom caption text) failed: %s", e)
+    # If custom_caption == "" (strip), don't send text items at all
 
     total = len(media_items) + len(text_items)
     target = f"topic {topic_id}" if topic_id else "chat"
@@ -733,12 +774,17 @@ async def _forward_link(context, payload, dest_group_id, topic_id,
                               "but it's not available. Run /status and check.")
         source_chat_id = payload["source_chat_id"]
         source_message_ids = payload["source_message_ids"]
+        # Load the custom_caption setting (None = use original, "" = strip,
+        # "<text>" = use this text)
+        from handlers.admin import _get_custom_caption
+        custom_caption = await _get_custom_caption(context)
         success, diag = await user_session.send_to_destination(
             source_chat_id=source_chat_id,
             source_message_ids=source_message_ids,
             dest_chat_id=dest_group_id,
             topic_id=topic_id,
             progress_callback=progress_callback,
+            custom_caption=custom_caption,
         )
         if not success:
             # Build a helpful error message — show the last few diagnostic lines

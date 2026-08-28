@@ -115,6 +115,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
         "/stop_scrape    — 🛑 stop the active scrape\n"
         "/scrape_status  — 📊 check scrape progress\n"
+        "/caption <text>  — 📝 set a custom caption (replaces original)\n"
+        "/caption strip   — 📝 strip ALL captions from forwarded media\n"
+        "/caption clear   — 📝 restore original captions\n"
         "/cancel         — cancel the latest pending forward\n"
         "\n*Sending content*\n"
         "• Send me a photo / video / text / file -> I show topics (if forum) "
@@ -128,7 +131,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n*Scrape flags*\n"
         "  `old` — oldest first (chronological)\n"
         "  `saved` — send to Saved Messages (default: destination group)\n"
-        "  Example: `/scrape https://t.me/c/123 saved old`\n"
+        "  `photo` / `video` / `doc` / `audio` / `voice` / `animation` — filter by media type\n"
+        "  `parallel=N` — set parallel sends (default 3, max 10)\n"
+        "  Example: `/scrape https://t.me/c/123 saved old videos parallel=5`\n"
+        "\n*Captions*\n"
+        "  `/caption <text>` — set a custom caption applied to all forwards\n"
+        "  `/caption strip` — strip ALL captions (forward media without any text)\n"
+        "  `/caption clear` — restore original caption behavior\n"
+        "  `/caption` (no args) — show current setting\n"
         "\n*Destination types*\n"
         "• Forum groups: pick a topic from the picker\n"
         "• Regular groups/channels: single Forward button (no topic picker)\n"
@@ -631,12 +641,14 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Send to "me" — Telethon's special entity for Saved Messages.
         # This is a direct call to send_to_destination with dest_chat_id="me"
         # which Telethon resolves to the user's own Saved Messages chat.
+        custom_caption = await _get_custom_caption(context)
         success, diag = await user_session.send_to_destination(
             source_chat_id=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
             source_message_ids=[parsed.message_id],
             dest_chat_id="me",  # Saved Messages
             topic_id=None,
             progress_callback=progress_cb,
+            custom_caption=custom_caption,
         )
     except Exception as e:
         logger.exception("/saved failed")
@@ -660,23 +672,32 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Scrape a channel — send all media (photos/videos) to destination.
 
     Usage:
-      /scrape <channel_url>              — newest first, send to destination group
-      /scrape <channel_url> old           — oldest first (chronological order)
-      /scrape <channel_url> saved        — send to Saved Messages (fastest)
-      /scrape <channel_url> saved old    — Saved Messages, oldest first
+      /scrape <channel_url> [flags]
+
+    Flags (any combination, space-separated):
+      old           — oldest first (chronological order)
+      saved         — send to Saved Messages (default: destination group)
+      photo         — only photos
+      video         — only videos
+      doc           — only documents
+      audio         — only audio
+      voice         — only voice messages
+      animation     — only animations (GIFs)
+      photos        — only photos (alias)
+      videos        — only videos (alias)
+      docs          — only documents (alias)
+      parallel=N    — set parallel send count (default 3, max 10)
 
     Examples:
       /scrape https://t.me/publicchannel
-      /scrape https://t.me/c/1234567890
       /scrape https://t.me/c/1234567890 saved old
-
-    The scrape runs in the background. Use /stop_scrape to stop it,
-    /scrape_status to check progress.
+      /scrape https://t.me/c/1234567890 photo video   — only photos and videos
+      /scrape https://t.me/c/1234567890 saved old videos parallel=5
 
     Notes:
-      - Only photos, videos, animations, documents, audio are forwarded
-      - Text-only messages are skipped
-      - Rate limit: 0.3 sec delay between sends (3 msgs/sec)
+      - If no media type filter is given, ALL media is forwarded
+      - Text-only messages are always skipped (they have no media)
+      - Rate limit: 0.3 sec delay between sends (per parallel slot)
       - On FloodWait, the bot sleeps and retries automatically
       - Protected (noforwards) channels use the same three-tier fallback
         as /saved — forward → send_message(file=) → download+send_file
@@ -706,23 +727,53 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage:\n"
-            "  `/scrape <channel_url>` — newest first\n"
-            "  `/scrape <channel_url> old` — oldest first\n"
-            "  `/scrape <channel_url> saved` — send to Saved Messages\n"
-            "  `/scrape <channel_url> saved old` — both options\n\n"
+            "Usage: `/scrape <channel_url> [flags]`\n\n"
+            "Flags:\n"
+            "  `old` — oldest first (chronological)\n"
+            "  `saved` — send to Saved Messages (default: destination group)\n"
+            "  `photo` / `photos` — only photos\n"
+            "  `video` / `videos` — only videos\n"
+            "  `doc` / `docs` — only documents\n"
+            "  `audio` — only audio\n"
+            "  `voice` — only voice messages\n"
+            "  `animation` — only animations (GIFs)\n"
+            "  `parallel=N` — set parallel sends (default 3, max 10)\n\n"
             "Examples:\n"
             "  `/scrape https://t.me/publicchannel`\n"
-            "  `/scrape https://t.me/c/1234567890 saved old`",
+            "  `/scrape https://t.me/c/1234567890 saved old`\n"
+            "  `/scrape https://t.me/c/1234567890 photo video`\n"
+            "  `/scrape https://t.me/c/123 saved old videos parallel=5`",
             parse_mode="Markdown",
         )
         return
 
     # Parse args: first arg is URL, rest are flags
     url = context.args[0]
-    flags = [a.lower() for a in context.args[1:]]
-    send_to_saved = "saved" in flags
-    oldest_first = "old" in flags or "oldest" in flags
+    raw_flags = [a.lower() for a in context.args[1:]]
+    send_to_saved = "saved" in raw_flags
+    oldest_first = "old" in raw_flags or "oldest" in raw_flags
+
+    # Parse media type filters
+    valid_media_types = {"photo", "video", "animation", "document", "audio", "voice"}
+    # Aliases: photos -> photo, videos -> video, docs -> document
+    alias_map = {"photos": "photo", "videos": "video", "docs": "document"}
+    media_types: list[str] = []
+    parallel = 3  # default
+    for flag in raw_flags:
+        # Resolve aliases
+        actual = alias_map.get(flag, flag)
+        if actual in valid_media_types:
+            if actual not in media_types:
+                media_types.append(actual)
+        elif flag.startswith("parallel="):
+            try:
+                p = int(flag.split("=", 1)[1])
+                parallel = max(1, min(p, 10))  # clamp 1..10
+            except ValueError:
+                pass
+    # If no media types specified, set to None (all media)
+    if not media_types:
+        media_types = None
 
     # Try parsing as a channel-only link first, then fall back to a post link
     parsed = parse_channel_link(url)
@@ -765,12 +816,19 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         dest_label = f"chat {dest_chat_id}"
 
+    # Build the filter description for the status message
+    filter_desc = "ALL media"
+    if media_types:
+        filter_desc = "only: " + ", ".join(media_types)
+
     # Initial status message
     status_msg = await update.effective_message.reply_text(
         f"🔍 Starting scrape...\n\n"
         f"Source: `{parsed.chat_ref}`\n"
         f"Destination: {dest_label}\n"
-        f"Order: {'oldest first' if oldest_first else 'newest first'}\n\n"
+        f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
+        f"Filter: {filter_desc}\n"
+        f"Parallel: {parallel} sends\n\n"
         f"_Use /stop_scrape to cancel, /scrape_status to check progress._",
         parse_mode="Markdown",
     )
@@ -788,6 +846,8 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "source_ref": parsed.chat_ref,
         "dest_label": dest_label,
         "order": "oldest" if oldest_first else "newest",
+        "filter": filter_desc,
+        "parallel": parallel,
     }
 
     # Build the status callback that edits the status message AND updates
@@ -812,6 +872,8 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Run the scrape as a background task
     async def scrape_task():
         try:
+            # Load the custom_caption setting (None=original, ""=strip, "<text>"=custom)
+            custom_caption = await _get_custom_caption(context)
             await user_session.scrape_channel(
                 source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
                 dest_chat_id=dest_chat_id,
@@ -819,6 +881,9 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reverse=oldest_first,
                 cancel_event=cancel_event,
                 status_callback=status_callback,
+                media_types=media_types,
+                parallel=parallel,
+                custom_caption=custom_caption,
             )
         except Exception as e:
             logger.exception("/scrape task failed")
@@ -833,6 +898,99 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
     logger.info("Scrape started for %s -> %s", parsed.chat_ref, dest_label)
+
+
+async def _get_custom_caption(context) -> str | None:
+    """Load the custom_caption setting from DB / bot_data cache.
+    Returns:
+      None — use original captions (legacy behavior)
+      "" — strip all captions
+      "<text>" — use this custom caption
+    """
+    # Check in-memory cache first (set by /caption command)
+    if "custom_caption" in context.bot_data:
+        return context.bot_data["custom_caption"]
+    # Fall back to DB
+    db = context.bot_data["db"]
+    raw = await db.get_runtime("custom_caption", None)
+    if raw is None or raw == "__none__":
+        return None  # use original
+    return raw  # "" means strip, anything else is custom text
+
+
+async def cmd_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or clear a custom caption applied to all forwarded media.
+
+    Usage:
+      /caption <text>      — set a custom caption (applied to all forwards)
+      /caption clear       — clear the custom caption (use original captions)
+      /caption strip       — always strip captions (no caption at all)
+      /caption             — show current setting
+
+    When a custom caption is set:
+      - /scrape sends media with your custom caption (no original captions)
+      - /saved sends media with your custom caption (no original captions)
+      - Direct forwards (links) send with your custom caption (no original)
+
+    Use `/caption clear` to restore original-caption behavior.
+    Use `/caption strip` to remove ALL captions (forward media without any text).
+    """
+    cfg = context.bot_data["config"]
+    db = context.bot_data["db"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/caption DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+
+    if not context.args:
+        # Show current setting
+        current = await _get_custom_caption(context)
+        if current is None:
+            current_str = "(not set — using original captions)"
+        elif current == "":
+            current_str = "(strip mode — all captions removed)"
+        else:
+            preview = current[:200] + ("..." if len(current) > 200 else "")
+            current_str = f"`{preview}`"
+        await update.effective_message.reply_text(
+            f"📝 Current caption setting:\n\n{current_str}\n\n"
+            f"Usage:\n"
+            f"  `/caption <text>` — set custom caption\n"
+            f"  `/caption clear` — restore original captions\n"
+            f"  `/caption strip` — remove all captions\n",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = " ".join(context.args)
+    if arg.lower() == "clear":
+        await db.set_runtime("custom_caption", "__none__")  # sentinel for "use original"
+        # Also clear from in-memory config cache if present
+        context.bot_data.pop("custom_caption", None)
+        await update.effective_message.reply_text(
+            "✅ Custom caption cleared. Forwards will use original captions."
+        )
+    elif arg.lower() == "strip":
+        await db.set_runtime("custom_caption", "")  # empty string = strip all
+        context.bot_data["custom_caption"] = ""
+        await update.effective_message.reply_text(
+            "✅ Caption mode: STRIP. All forwarded media will have no caption."
+        )
+    else:
+        # Set custom caption (truncate to Telegram's 1024-char caption limit)
+        if len(arg) > 1024:
+            arg = arg[:1024]
+            await update.effective_message.reply_text(
+                f"⚠️ Caption truncated to 1024 chars (Telegram's limit)."
+            )
+        await db.set_runtime("custom_caption", arg)
+        context.bot_data["custom_caption"] = arg
+        preview = arg[:200] + ("..." if len(arg) > 200 else "")
+        await update.effective_message.reply_text(
+            f"✅ Custom caption set:\n\n`{preview}`\n\n"
+            f"All forwarded media will use this caption instead of the original.",
+            parse_mode="Markdown",
+        )
 
 
 async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -872,11 +1030,13 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Source: `{status.get('source_ref', '?')}`\n"
         f"Destination: {status.get('dest_label', '?')}\n"
         f"Order: {status.get('order', '?')}\n"
+        f"Filter: {status.get('filter', 'ALL media')}\n"
+        f"Parallel: {status.get('parallel', 3)}\n"
         f"Elapsed: {elapsed:.0f} sec\n\n"
         f"Total seen: {status.get('total_seen', 0)}\n"
         f"Sent: {status.get('sent_count', 0)}\n"
         f"Failed: {status.get('failed_count', 0)}\n"
-        f"Skipped (no media): {status.get('skipped_count', 0)}\n"
+        f"Skipped (filtered/no media): {status.get('skipped_count', 0)}\n"
         f"Last msg ID: {status.get('last_message_id', 0)}",
         parse_mode="Markdown",
     )
@@ -928,4 +1088,5 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("scrape", cmd_scrape))
     app.add_handler(CommandHandler("stop_scrape", cmd_stop_scrape))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
+    app.add_handler(CommandHandler("caption", cmd_caption))
     app.add_handler(CommandHandler("cancel", cmd_cancel))

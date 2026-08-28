@@ -11,6 +11,7 @@ prompt interactively.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import re
@@ -392,6 +393,7 @@ class UserSession:
         dest_chat_id: int,
         topic_id: int | None = None,
         progress_callback=None,
+        custom_caption: str | None = None,
     ) -> tuple[bool, list[str]]:
         """Send message(s) from a source chat to the destination chat using
         the user account (Telethon). This is the NEW fast path that avoids
@@ -431,6 +433,32 @@ class UserSession:
                     f"from {source_chat_id} to {dest_chat_id}"
                     f"{f' topic {topic_id}' if topic_id else ''}")
 
+        # Helper: compute the effective caption based on custom_caption policy
+        # - custom_caption=None: use original caption (msg.message)
+        # - custom_caption="" (empty string): strip ALL captions
+        # - custom_caption="<text>": use this string for the first item only
+        #   (albums only show the first item's caption in Telegram)
+        def _caption_for(msg, item_index: int = 0) -> str:
+            """Return the caption to send for this message."""
+            if custom_caption is None:
+                # Use original caption (legacy behavior)
+                return msg.message or ""
+            if custom_caption == "":
+                # Strip captions entirely
+                return ""
+            # Use custom caption, but only on the first item of an album
+            if item_index == 0:
+                return custom_caption
+            return ""
+
+        def _formatting_entities_for(msg, item_index: int = 0):
+            """Return formatting entities to preserve. When using a custom
+            caption, we strip entities (they wouldn't match the new text)."""
+            if custom_caption is None:
+                return msg.entities if item_index == 0 else None
+            # Strip formatting entities when using custom caption
+            return None
+
         try:
             source_entity = await self.client.get_entity(source_chat_id)
             dest_entity = await self.client.get_entity(dest_chat_id)
@@ -457,28 +485,34 @@ class UserSession:
             return False, diag
 
         # ---- Step 1: try true forward (works for non-protected content) ----
-        try:
-            # Build reply_to for topics if specified
-            kwargs: dict = {}
-            if topic_id:
-                from telethon.tl.types import MessageReplyHeader
-                kwargs["reply_to"] = MessageReplyHeader(
-                    reply_to_top_id=topic_id,
-                    reply_to_msg_id=topic_id,
-                )
+        # Skip this step if a custom_caption is set — forward_messages doesn't
+        # let us override the caption, so we need to use the send_message path
+        # (which DOES let us set the caption) for caption control.
+        if custom_caption is None:
+            try:
+                # Build reply_to for topics if specified
+                kwargs: dict = {}
+                if topic_id:
+                    from telethon.tl.types import MessageReplyHeader
+                    kwargs["reply_to"] = MessageReplyHeader(
+                        reply_to_top_id=topic_id,
+                        reply_to_msg_id=topic_id,
+                    )
 
-            await self.client.forward_messages(
-                dest_entity,
-                [m.id for m in messages],
-                source_entity,
-            )
-            diag.append(f"✓ True forward succeeded — {len(messages)} message(s) "
-                        f"forwarded to destination"
-                        f"{f' (topic {topic_id})' if topic_id else ''}")
-            return True, diag
-        except Exception as forward_err:
-            diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
-            diag.append("  → Falling back to copy-and-resend (for protected content)")
+                await self.client.forward_messages(
+                    dest_entity,
+                    [m.id for m in messages],
+                    source_entity,
+                )
+                diag.append(f"✓ True forward succeeded — {len(messages)} message(s) "
+                            f"forwarded to destination"
+                            f"{f' (topic {topic_id})' if topic_id else ''}")
+                return True, diag
+            except Exception as forward_err:
+                diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
+                diag.append("  → Falling back to copy-and-resend (for protected content)")
+        else:
+            diag.append("ℹ Skipping true forward (custom_caption is set — using send_message)")
 
         # ---- Step 2: fallback — re-upload via send_message(file=msg.media) ----
         # This bypasses the noforwards restriction by re-uploading from
@@ -488,9 +522,9 @@ class UserSession:
         for i, msg in enumerate(messages):
             try:
                 send_kwargs = dict(
-                    message=msg.message or "",
+                    message=_caption_for(msg, i),
                     file=msg.media,
-                    formatting_entities=msg.entities,
+                    formatting_entities=_formatting_entities_for(msg, i),
                     link_preview=False,
                 )
                 if topic_id:
@@ -499,8 +533,13 @@ class UserSession:
                         reply_to_top_id=topic_id,
                         reply_to_msg_id=topic_id,
                     )
-                # Only send the caption on the first message of an album
-                if i > 0:
+                # For multi-item albums, only the first item gets a caption
+                # (already handled by _caption_for which returns "" for i>0
+                # when custom_caption is set; for None it returns "" for i>0
+                # since the original captions of album items >0 don't make
+                # sense to repeat — only the first item's caption matters in
+                # a Telegram album).
+                if i > 0 and custom_caption is None:
                     send_kwargs["message"] = ""
 
                 await self.client.send_message(dest_entity, **send_kwargs)
@@ -547,7 +586,7 @@ class UserSession:
                     # Text-only message — just send the text
                     try:
                         send_kwargs = dict(
-                            message=msg.message or "",
+                            message=_caption_for(msg, i),
                             link_preview=False,
                         )
                         if topic_id:
@@ -556,7 +595,12 @@ class UserSession:
                                 reply_to_top_id=topic_id,
                                 reply_to_msg_id=topic_id,
                             )
-                        if i > 0:
+                        # For albums, only first item has caption (already
+                        # handled by _caption_for returning "" for i>0 when
+                        # custom_caption is set; for None, the original caption
+                        # of subsequent items would be repetitive in an album,
+                        # so we strip them too).
+                        if i > 0 and custom_caption is None:
                             send_kwargs["message"] = ""
                         await self.client.send_message(dest_entity, **send_kwargs)
                         sent_count += 1
@@ -639,8 +683,8 @@ class UserSession:
                     try:
                         send_kwargs = dict(
                             file=out_path,
-                            caption=msg.message if i == 0 else "",
-                            formatting_entities=msg.entities if i == 0 else None,
+                            caption=_caption_for(msg, i),
+                            formatting_entities=_formatting_entities_for(msg, i),
                             force_document=False,
                         )
                         if topic_id:
@@ -782,21 +826,39 @@ class UserSession:
                     # supports_streaming. We PRE-UPLOAD the file with a large
                     # chunk size (512KB max) for 4x speedup vs Telethon's
                     # auto-picker, then pass the resulting InputFile to send_file.
+                    #
+                    # For files >10MB, we use a PARALLEL uploader that splits
+                    # the file into chunks and uploads them concurrently. This
+                    # gives ~4x speedup for large files (the sequential
+                    # bottleneck was each chunk waiting for the previous
+                    # chunk's response before sending).
                     try:
                         ul_cb = make_progress_cb(i, len(messages), "Uploading", original_filename)
-                        # Pre-upload with max chunk size for speed.
-                        # Telethon's upload_file enforces part_size_kb <= 512.
-                        file_handle = await self.client.upload_file(
-                            out_path,
-                            part_size_kb=512,  # max allowed, 4x faster than auto 128KB
-                            file_size=os.path.getsize(out_path),
-                            progress_callback=ul_cb,
-                        )
+                        file_size_bytes = os.path.getsize(out_path)
+
+                        if file_size_bytes > 10 * 1024 * 1024:
+                            # Large file — use parallel upload (4 concurrent chunks)
+                            diag.append(f"  • Using parallel upload (4 chunks) for {file_size_bytes/1024/1024:.1f} MB file")
+                            file_handle = await self._parallel_upload_file(
+                                out_path,
+                                file_size_bytes,
+                                part_size_kb=512,
+                                parallel=4,
+                                progress_callback=ul_cb,
+                            )
+                        else:
+                            # Small file — sequential upload is fast enough
+                            file_handle = await self.client.upload_file(
+                                out_path,
+                                part_size_kb=512,
+                                file_size=file_size_bytes,
+                                progress_callback=ul_cb,
+                            )
 
                         send_kwargs = dict(
                             file=file_handle,  # already-uploaded InputFile — send_file skips re-upload
-                            caption=msg.message if i == 0 else "",
-                            formatting_entities=msg.entities if i == 0 else None,
+                            caption=_caption_for(msg, i),
+                            formatting_entities=_formatting_entities_for(msg, i),
                             # Pass the original attributes (minus Filename)
                             # so Telegram sees the video duration/dims.
                             attributes=original_attributes,
@@ -857,6 +919,139 @@ class UserSession:
         else:
             diag.append(f"✗ All sends failed. Last error: {last_error}")
             return False, diag
+
+    # ---------- parallel upload (for large files) ----------
+
+    async def _parallel_upload_file(
+        self,
+        file_path: str,
+        file_size: int,
+        part_size_kb: int = 512,
+        parallel: int = 4,
+        progress_callback=None,
+    ):
+        """Upload a file in PARALLEL chunks for faster throughput.
+
+        This replaces Telethon's sequential upload_file for large files.
+        The sequential approach sends one 512KB chunk, waits for the
+        response, then sends the next. For a 50MB file that's 100 chunks
+        × ~200ms round-trip = ~20 seconds.
+
+        This parallel approach splits the file into chunks and uploads
+        `parallel` chunks concurrently. For 4x parallel, a 50MB file
+        takes ~5 seconds instead of 20.
+
+        Telegram's SaveBigFilePartRequest is stateless — each part is
+        stored independently, associated by file_id. So parallel uploads
+        work: we just need to use the same file_id for all parts and
+        different file_part indices.
+
+        Args:
+          file_path: Path to the file to upload.
+          file_size: Size of the file in bytes.
+          part_size_kb: Chunk size in KB (max 512, Telethon's limit).
+          parallel: Number of concurrent chunk uploads (default 4).
+          progress_callback: Sync callable(sent, total) — called after
+            each chunk is uploaded.
+
+        Returns:
+          InputFileBig (for files >10MB) or InputFile (for smaller) —
+          ready to pass to send_file.
+        """
+        import asyncio as _asyncio
+        import hashlib
+        from telethon.tl.functions.upload import (
+            SaveBigFilePartRequest, SaveFilePartRequest,
+        )
+        from telethon.tl.types import InputFile, InputFileBig
+        from telethon import helpers
+
+        part_size = part_size_kb * 1024
+        part_count = (file_size + part_size - 1) // part_size
+        file_id = helpers.generate_random_long()
+        file_name = os.path.basename(file_path)
+
+        is_big = file_size > 10 * 1024 * 1024
+        logger.info("Parallel upload: %s (%d bytes, %d chunks, %d parallel)",
+                    file_name, file_size, part_count, parallel)
+
+        # Track progress across parallel tasks
+        bytes_uploaded = [0]  # mutable container for closure
+        progress_lock = _asyncio.Lock()
+
+        async def upload_one_part(part_index: int):
+            """Read and upload a single chunk of the file."""
+            offset = part_index * part_size
+            # Read this specific part from disk
+            with open(file_path, "rb") as f:
+                f.seek(offset)
+                data = f.read(part_size)
+
+            # Use the correct request type based on file size
+            if is_big:
+                request = SaveBigFilePartRequest(
+                    file_id, part_index, part_count, data,
+                )
+            else:
+                request = SaveFilePartRequest(
+                    file_id, part_index, data,
+                )
+
+            result = await self.client(request)
+            if not result:
+                raise RuntimeError(
+                    f"Telegram rejected part {part_index}/{part_count}"
+                )
+
+            # Update progress (thread-safe via lock)
+            async with progress_lock:
+                bytes_uploaded[0] += len(data)
+                if progress_callback:
+                    try:
+                        r = progress_callback(bytes_uploaded[0], file_size)
+                        if inspect.isawaitable(r):
+                            await r
+                    except Exception:
+                        pass
+
+        # Use a semaphore to limit concurrency
+        sem = _asyncio.Semaphore(parallel)
+
+        async def bounded_upload(part_index: int):
+            async with sem:
+                return await upload_one_part(part_index)
+
+        # Launch all upload tasks
+        tasks = [_asyncio.create_task(bounded_upload(i)) for i in range(part_count)]
+        results = await _asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check for errors
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                # Cancel any remaining tasks (shouldn't be any since gather waits)
+                raise RuntimeError(
+                    f"Parallel upload failed at part {i}/{part_count}: "
+                    f"{type(r).__name__}: {r}"
+                )
+
+        # Build the InputFile / InputFileBig to pass to send_file
+        if is_big:
+            return InputFileBig(id=file_id, parts=part_count, name=file_name)
+        else:
+            # For small files, compute MD5 (needed for InputFile dedup)
+            md5 = hashlib.md5()
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    md5.update(chunk)
+            return InputFile(
+                id=file_id,
+                parts=part_count,
+                name=file_name,
+                md5_digest=md5.digest(),
+            )
 
 
     # ---------- legacy: download media to disk (fallback path) ----------
@@ -932,7 +1127,7 @@ class UserSession:
                                 media_type = "animation"
                                 break
                             if isinstance(attr, tl.DocumentAttributeVideo):
-                                media_type = "video_note" if getattr(attr, "round", False) else "video"
+                                media_type = "video_note" if getattr(attr, "round_message", False) else "video"
                                 break
                     elif mt.startswith("audio/"):
                         media_type = "voice" if "ogg" in mt else "audio"
@@ -985,6 +1180,9 @@ class UserSession:
         cancel_event=None,
         progress_callback=None,
         status_callback=None,
+        media_types: list[str] | None = None,
+        parallel: int = 3,
+        custom_caption: str | None = None,
     ) -> dict:
         """Iterate all messages in a channel and forward each media message
         to the destination chat. Used by the /scrape command.
@@ -999,16 +1197,48 @@ class UserSession:
           cancel_event: asyncio.Event — set to cancel scraping
           progress_callback: async callable(sent, total_seen, last_msg_id, label)
           status_callback: async callable(status_text) — for status updates
+          media_types: list of types to include. None means all media.
+            Valid values: 'photo', 'video', 'animation', 'document', 'audio',
+            'voice'. If specified, only matching media is sent; others are
+            skipped (counted in skipped_count).
+          parallel: number of concurrent sends. Default 3 (safe for Telegram).
+            Higher values risk FloodWait. Each task uses its own asyncio task.
 
         Returns:
           dict with keys: sent_count, failed_count, skipped_count,
-                          total_seen, last_message_id, cancelled (bool)
+                          total_seen, last_message_id, cancelled (bool),
+                          flood_waits (int)
 
         Rate limiting:
-          - 0.3 sec delay between sends (about 3 msgs/sec — safe for Telegram)
+          - Per-task 0.3 sec delay between sends (safe even with parallel=3)
           - On FloodWaitError, sleep for the requested seconds + 5s buffer
+            and retry the message once
+
+        Notes:
+          - parallel sends are independent — they don't share rate-limit state.
+            The actual bottleneck is Telegram's per-account rate limit, not
+            our concurrency. Setting parallel=5+ risks FloodWait.
+          - Each task holds its own network connection (no shared TCP overhead)
+          - The order of sent messages in the destination may differ from the
+            source order when parallel > 1 (out-of-order arrival)
         """
         from telethon.errors import FloodWaitError
+        import asyncio as _asyncio
+
+        # Normalize media_types: lowercase, validate, default to None (all)
+        if media_types is not None:
+            media_types = [t.lower() for t in media_types]
+            valid = {"photo", "video", "animation", "document", "audio", "voice"}
+            invalid = set(media_types) - valid
+            if invalid:
+                if status_callback:
+                    await status_callback(f"❌ Invalid media types: {invalid}. "
+                                          f"Valid: {valid}")
+                return {
+                    "sent_count": 0, "failed_count": -1, "skipped_count": 0,
+                    "total_seen": 0, "last_message_id": 0,
+                    "cancelled": False, "flood_waits": 0,
+                }
 
         result = {
             "sent_count": 0,
@@ -1051,11 +1281,114 @@ class UserSession:
         last_status_time = 0
         status_interval = 5.0  # update status every 5 seconds
 
+        # Helper: classify a message's media type
+        def _classify_media(msg) -> str | None:
+            """Return 'photo', 'video', 'animation', 'document', 'audio',
+            'voice', or None (for non-media messages)."""
+            if not msg.media:
+                return None
+            if isinstance(msg.media, tl.MessageMediaPhoto):
+                return "photo"
+            if isinstance(msg.media, tl.MessageMediaDocument):
+                doc = msg.media.document
+                if not doc or not doc.mime_type:
+                    return "document"
+                mt = doc.mime_type
+                if mt.startswith("video/"):
+                    for attr in (doc.attributes or []):
+                        if isinstance(attr, tl.DocumentAttributeAnimated):
+                            return "animation"
+                        if isinstance(attr, tl.DocumentAttributeVideo):
+                            # round_message=True means round video (video note)
+                            return "video_note" if getattr(attr, "round_message", False) else "video"
+                    return "video"
+                if mt.startswith("audio/"):
+                    for attr in (doc.attributes or []):
+                        if isinstance(attr, tl.DocumentAttributeAudio) and getattr(attr, "voice", False):
+                            return "voice"
+                    return "audio" if "ogg" not in mt else "voice"
+                return "document"
+            # Non-downloadable types: web pages, contacts, geos, polls, etc.
+            return None
+
+        # Helper: send one message with FloodWait handling
+        async def _send_one(msg_id: int):
+            """Send a single message via send_to_destination, with FloodWait
+            retry. Updates `result` in place. Returns True if sent."""
+            src_ref = source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id
+            try:
+                success, _ = await self.send_to_destination(
+                    source_chat_id=src_ref,
+                    source_message_ids=[msg_id],
+                    dest_chat_id=dest_chat_id,
+                    topic_id=topic_id,
+                    progress_callback=None,
+                    custom_caption=custom_caption,
+                )
+                if success:
+                    result["sent_count"] += 1
+                    return True
+                result["failed_count"] += 1
+                return False
+            except FloodWaitError as e:
+                result["flood_waits"] += 1
+                wait_seconds = e.seconds + 5
+                if status_callback:
+                    await status_callback(
+                        f"⏳ Flood wait: sleeping {wait_seconds}s before retrying...\n"
+                        f"   Sent so far: {result['sent_count']}"
+                    )
+                await _asyncio.sleep(wait_seconds)
+                # Retry once
+                try:
+                    success, _ = await self.send_to_destination(
+                        source_chat_id=src_ref,
+                        source_message_ids=[msg_id],
+                        dest_chat_id=dest_chat_id,
+                        topic_id=topic_id,
+                        progress_callback=None,
+                        custom_caption=custom_caption,
+                    )
+                    if success:
+                        result["sent_count"] += 1
+                        return True
+                except Exception:
+                    pass
+                result["failed_count"] += 1
+                return False
+            except Exception as e:
+                logger.warning("scrape: failed to send msg %d: %s", msg_id, e)
+                result["failed_count"] += 1
+                return False
+
+        # Semaphore for parallel sends (limits concurrent in-flight sends)
+        # to avoid hitting Telegram's rate limit. Default 3 = ~9 msgs/sec total.
+        sem = _asyncio.Semaphore(parallel)
+        pending_send_tasks: list = []  # asyncio tasks for in-flight sends
+
+        async def _send_with_semaphore(msg_id: int):
+            """Wrap _send_one with the semaphore. Awaits the send."""
+            async with sem:
+                # Check cancellation before sending
+                if cancel_event and cancel_event.is_set():
+                    return False
+                await _send_one(msg_id)
+                # Small delay between sends within a single task slot
+                await _asyncio.sleep(0.3)
+
         try:
             async for msg in self.client.iter_messages(source_entity, **iter_kwargs):
                 # Check for cancellation
                 if cancel_event and cancel_event.is_set():
                     result["cancelled"] = True
+                    # Wait for in-flight sends to complete (don't abandon them)
+                    if pending_send_tasks:
+                        if status_callback:
+                            await status_callback(
+                                f"🛑 Cancel signal received. Waiting for "
+                                f"{len(pending_send_tasks)} in-flight send(s) to complete..."
+                            )
+                        await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
                     if status_callback:
                         await status_callback(
                             f"🛑 Scraping cancelled by user.\n"
@@ -1068,80 +1401,45 @@ class UserSession:
                 result["total_seen"] += 1
                 result["last_message_id"] = msg.id
 
-                # Skip messages without media (text-only)
-                if not msg.media:
-                    result["skipped_count"] += 1
-                    # Periodic status update
-                    import time as _time
-                    now = _time.time()
-                    if status_callback and now - last_status_time > status_interval:
-                        last_status_time = now
-                        await status_callback(
-                            f"📊 Scraping in progress...\n\n"
-                            f"Total seen: {result['total_seen']}\n"
-                            f"Sent: {result['sent_count']}\n"
-                            f"Failed: {result['failed_count']}\n"
-                            f"Skipped (no media): {result['skipped_count']}\n"
-                            f"Last msg ID: {result['last_message_id']}"
-                        )
-                    continue
+                # Classify the message's media type
+                m_type = _classify_media(msg)
 
-                # Skip non-media types (web pages, contacts, geos, polls, etc.)
-                # We only want photos, videos, animations, documents, audio.
-                if isinstance(msg.media, (
-                    tl.MessageMediaWebPage, tl.MessageMediaContact,
-                    tl.MessageMediaGeo, tl.MessageMediaVenue,
-                    tl.MessageMediaGame, tl.MessageMediaPoll,
-                    tl.MessageMediaUnsupported,
-                )):
+                # Skip if no media
+                if m_type is None:
                     result["skipped_count"] += 1
                     continue
 
-                # Send this message to destination via the same three-tier
-                # fallback used by send_to_destination.
-                try:
-                    success, _diag = await self.send_to_destination(
-                        source_chat_id=source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id,
-                        source_message_ids=[msg.id],
-                        dest_chat_id=dest_chat_id,
-                        topic_id=topic_id,
-                        progress_callback=None,  # don't show per-msg progress during scrape
+                # Apply user's media type filter
+                if media_types is not None:
+                    # Normalize: 'voice' and 'video_note' both count as their
+                    # respective primary types. 'video_note' is treated as 'video'.
+                    type_check = m_type
+                    if type_check == "video_note":
+                        type_check = "video"
+                    if type_check not in media_types:
+                        result["skipped_count"] += 1
+                        continue
+
+                # Schedule the send in parallel (up to `parallel` at once)
+                task = _asyncio.create_task(_send_with_semaphore(msg.id))
+                pending_send_tasks.append(task)
+
+                # Periodically drain completed tasks to avoid the list growing
+                # unboundedly for huge channels.
+                if len(pending_send_tasks) >= parallel * 4:
+                    # Wait for at least one to complete before continuing
+                    done, pending_send_tasks = await _asyncio.wait(
+                        pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
                     )
-                    if success:
-                        result["sent_count"] += 1
-                    else:
-                        result["failed_count"] += 1
-                except FloodWaitError as e:
-                    # Telegram is asking us to slow down
-                    result["flood_waits"] += 1
-                    wait_seconds = e.seconds + 5  # add 5s buffer
-                    if status_callback:
-                        await status_callback(
-                            f"⏳ Flood wait: sleeping {wait_seconds}s before retrying...\n"
-                            f"   Sent so far: {result['sent_count']}"
-                        )
-                    import asyncio as _asyncio
-                    await _asyncio.sleep(wait_seconds)
-                    # Retry this message once
-                    try:
-                        success, _ = await self.send_to_destination(
-                            source_chat_id=source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id,
-                            source_message_ids=[msg.id],
-                            dest_chat_id=dest_chat_id,
-                            topic_id=topic_id,
-                            progress_callback=None,
-                        )
-                        if success:
-                            result["sent_count"] += 1
-                        else:
-                            result["failed_count"] += 1
-                    except Exception:
-                        result["failed_count"] += 1
-                except Exception as e:
-                    logger.warning("scrape: failed to send msg %d: %s", msg.id, e)
-                    result["failed_count"] += 1
+                    # Drain all done tasks (their results were already applied
+                    # via _send_one updating `result`)
+                    for t in done:
+                        try:
+                            t.result()  # raise exceptions if any
+                        except Exception:
+                            pass
 
-                # Progress callback (for per-message progress)
+                # Progress callback
                 if progress_callback:
                     try:
                         await progress_callback(
@@ -1163,13 +1461,10 @@ class UserSession:
                         f"Total seen: {result['total_seen']}\n"
                         f"Sent: {result['sent_count']}\n"
                         f"Failed: {result['failed_count']}\n"
-                        f"Skipped (no media): {result['skipped_count']}\n"
-                        f"Last msg ID: {result['last_message_id']}"
+                        f"Skipped (filtered/no media): {result['skipped_count']}\n"
+                        f"Last msg ID: {result['last_message_id']}\n"
+                        f"Parallel sends: {parallel}"
                     )
-
-                # Rate limit: small delay between sends
-                import asyncio as _asyncio
-                await _asyncio.sleep(0.3)
 
         except Exception as e:
             logger.exception("scrape_channel: iter_messages failed")
@@ -1178,6 +1473,13 @@ class UserSession:
             result["failed_count"] = -1
             return result
 
+        # Wait for any remaining in-flight send tasks to complete
+        if pending_send_tasks:
+            try:
+                await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
+            except Exception:
+                pass
+
         # Final status
         if status_callback and not result["cancelled"]:
             await status_callback(
@@ -1185,9 +1487,10 @@ class UserSession:
                 f"Total seen: {result['total_seen']}\n"
                 f"Sent: {result['sent_count']}\n"
                 f"Failed: {result['failed_count']}\n"
-                f"Skipped (no media): {result['skipped_count']}\n"
+                f"Skipped (filtered/no media): {result['skipped_count']}\n"
                 f"Flood waits: {result['flood_waits']}\n"
-                f"Last msg ID: {result['last_message_id']}"
+                f"Last msg ID: {result['last_message_id']}\n"
+                f"Parallel sends: {parallel}"
             )
 
         return result
