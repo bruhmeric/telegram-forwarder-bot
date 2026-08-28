@@ -76,6 +76,30 @@ def _to_input_media(msg) -> Any | None:
     return None
 
 
+def _extract_media_info(msg) -> dict | None:
+    """Extract media info from a message for use with InputMedia* and
+    send_media_group. Returns None for non-media messages (e.g. text-only).
+
+    The returned dict has keys:
+      - type: 'photo' | 'video' | 'animation' | 'document' | 'audio'
+      - file_id: str (Telegram file ID — usable by the bot to re-send)
+      - caption: str | None (the original caption, if any)
+    """
+    caption = msg.caption
+    if msg.photo:
+        # photo[-1] is the largest size
+        return {"type": "photo", "file_id": msg.photo[-1].file_id, "caption": caption}
+    if msg.video:
+        return {"type": "video", "file_id": msg.video.file_id, "caption": caption}
+    if msg.animation:
+        return {"type": "animation", "file_id": msg.animation.file_id, "caption": caption}
+    if msg.document:
+        return {"type": "document", "file_id": msg.document.file_id, "caption": caption}
+    if msg.audio:
+        return {"type": "audio", "file_id": msg.audio.file_id, "caption": caption}
+    return None
+
+
 # ---------- main entry ----------
 
 async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -114,12 +138,39 @@ async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _handle_album_message(update, context, chat_id, user_id, media_group_id, msg):
-    """Debounce album items, show picker once after accumulation."""
+    """Debounce album items, show picker once after accumulation.
+
+    IMPORTANT: we capture the file_id of each item's media (photo/video/etc.)
+    so we can later use send_media_group (the Bot API's actual "send as album"
+    method). The previous approach used copy_message per item, which sends
+    them as separate messages and never groups them as an album — plus it
+    times out for large albums due to Telegram's rate limits.
+
+    We also capture text-only items (no media) and send them separately.
+    """
     db = context.bot_data["db"]
     batches = context.chat_data.setdefault("album_batches", {})
     key = (chat_id, media_group_id)
-    batch = batches.get(key, {"user_id": user_id, "chat_id": chat_id, "message_ids": []})
+    batch = batches.get(key, {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "media_items": [],   # list of {type, file_id, caption}
+        "text_items": [],    # list of {text} for non-media items in the group
+        "message_ids": [],   # kept for backward compatibility / debugging
+    })
+
+    # Always track the message id
     batch["message_ids"].append(msg.message_id)
+
+    # Extract media info from this item
+    media_info = _extract_media_info(msg)
+    if media_info:
+        batch["media_items"].append(media_info)
+    elif msg.text:
+        # Text-only item in a "media group" — rare but happens for mixed
+        # text+media albums where Telegram splits them
+        batch["text_items"].append({"text": msg.text, "message_id": msg.message_id})
+
     batches[key] = batch
 
     # Cancel previously scheduled picker (debounce)
@@ -133,18 +184,41 @@ async def _handle_album_message(update, context, chat_id, user_id, media_group_i
         except asyncio.CancelledError:
             return
         try:
-            ids = batch["message_ids"]
+            media_items = batch["media_items"]
+            text_items = batch["text_items"]
+            n_media = len(media_items)
+            n_text = len(text_items)
+            total = n_media + n_text
+
+            # Build a label that reflects what was actually captured
+            if n_media and not n_text:
+                # Compact summary like "3 photo, 2 video"
+                type_counts: dict[str, int] = {}
+                for m in media_items:
+                    type_counts[m["type"]] = type_counts.get(m["type"], 0) + 1
+                summary = ", ".join(f"{c} {t}" for t, c in type_counts.items())
+                label = f"Album of {n_media} items ({summary}) — pick a topic:"
+            elif n_media and n_text:
+                label = (f"Album of {n_media} media + {n_text} text item(s) "
+                         f"— pick a topic:")
+            else:
+                label = f"Album of {n_text} text item(s) — pick a topic:"
+
             pending_id = await db.create_pending(
                 user_id=user_id,
                 source_chat_id=chat_id,
-                source_message_id=ids[0],
-                payload={"kind": "album", "message_ids": ids},
+                source_message_id=batch["message_ids"][0] if batch["message_ids"] else 0,
+                payload={
+                    "kind": "album",
+                    "media_items": media_items,
+                    "text_items": text_items,
+                    "message_ids": batch["message_ids"],  # kept for debugging
+                },
                 kind="direct",
             )
             # Send a NEW message to the user with the picker (since we can't
             # reply to the "last" album item cleanly)
-            await _send_picker_new(context, chat_id, pending_id,
-                                    label=f"Album of {len(ids)} items — pick a topic:")
+            await _send_picker_new(context, chat_id, pending_id, label=label)
             batches.pop(key, None)
         except Exception:
             logger.exception("album picker task failed")
@@ -260,17 +334,25 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Show a "Forwarding..." message immediately so the user knows the tap
     # was registered. For albums, include the count so they have a sense of
     # how long it'll take.
-    if kind == "direct" and payload.get("kind") == "album":
-        n = len(payload["message_ids"])
-        await q.edit_message_text(f"Forwarding {n} items to topic {topic_id}...")
+    is_album = (kind == "direct" and payload.get("kind") == "album")
+    if is_album:
+        n_media = len(payload.get("media_items") or [])
+        n_text = len(payload.get("text_items") or [])
+        if n_media:
+            await q.edit_message_text(
+                f"Forwarding {n_media} media item(s) to topic {topic_id}..."
+            )
+        else:
+            await q.edit_message_text(
+                f"Forwarding {n_text} text item(s) to topic {topic_id}..."
+            )
     else:
         await q.edit_message_text(f"Forwarding to topic {topic_id}...")
 
     try:
         if kind == "direct":
-            if payload.get("kind") == "album":
-                await _forward_album(context, src_chat_id,
-                                      payload["message_ids"], group_id, topic_id)
+            if is_album:
+                await _forward_album(context, payload, group_id, topic_id)
             else:
                 await _forward_single(context, src_chat_id, src_msg_id,
                                        group_id, topic_id)
@@ -282,9 +364,16 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await db.delete_pending(pending_id)
-    if kind == "direct" and payload.get("kind") == "album":
-        n = len(payload["message_ids"])
-        await q.edit_message_text(f"Done — {n} items sent to topic {topic_id}.")
+    if is_album:
+        n_media = len(payload.get("media_items") or [])
+        n_text = len(payload.get("text_items") or [])
+        parts = []
+        if n_media:
+            parts.append(f"{n_media} media item(s)")
+        if n_text:
+            parts.append(f"{n_text} text item(s)")
+        summary = " + ".join(parts) if parts else "items"
+        await q.edit_message_text(f"Done — {summary} sent to topic {topic_id}.")
     else:
         await q.edit_message_text(f"Done — sent to topic {topic_id}.")
 
@@ -301,43 +390,127 @@ async def _forward_single(context, src_chat_id, src_msg_id, dest_group_id, topic
     )
 
 
-async def _forward_album(context, src_chat_id, message_ids, dest_group_id, topic_id) -> None:
-    """Forward all items in an album to the destination topic IN PARALLEL.
+async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
+    """Forward an album to the destination topic using send_media_group.
 
-    Previously this used a sequential loop, which caused timeouts for large
-    albums (10 items × 2s = 20s). Now we use asyncio.gather to send all
-    copy_message requests concurrently. Telegram will deliver them in order
-    based on message_id; they may or may not appear as a single grouped
-    album in the destination depending on Telegram's grouping heuristics.
+    This is the Bot API's actual "send as album" method — items appear in the
+    destination as a single grouped album with proper navigation arrows.
 
-    If you need strict album grouping in the destination, the bot would
-    need to download each item via Telethon and re-send via
-    send_media_group — that's a future enhancement.
+    Telegram limits send_media_group to 10 items per call. For albums larger
+    than 10, we split into multiple send_media_group calls. Each call appears
+    as a separate (but still grouped) album in the destination.
+
+    Photos, videos, and animations can be mixed in an album (Telegram
+    supports this). Documents and audio can NOT be in an album — they must
+    be sent separately via send_document / send_audio.
+
+    Text-only items (rare in a "media group" — Telegram usually splits them
+    out) are sent as separate messages.
     """
-    if not message_ids:
+    media_items: list[dict] = payload.get("media_items") or []
+    text_items: list[dict] = payload.get("text_items") or []
+
+    if not media_items and not text_items:
+        # Backward compat with old payload format that only had message_ids
+        # (no longer used, but we keep it so any pre-existing pending forwards
+        # don't crash — they'll just be skipped here)
+        logger.warning("_forward_album: payload has no media_items or text_items")
         return
 
-    tasks = [
-        context.bot.copy_message(
-            chat_id=dest_group_id,
-            from_chat_id=src_chat_id,
-            message_id=mid,
-            message_thread_id=topic_id,
-        )
-        for mid in message_ids
-    ]
-    # Parallelize — return_exceptions=True so one failure doesn't cancel the others
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    failed = [(mid, r) for mid, r in zip(message_ids, results) if isinstance(r, Exception)]
-    succeeded = len(results) - len(failed)
-    if failed:
-        logger.warning("Album forward: %d/%d items failed: %s",
-                       len(failed), len(results), failed[:3])
-        if succeeded == 0:
-            # All failed — re-raise the first error so the user sees it
-            raise failed[0][1]
+    from telegram import (
+        InputMediaPhoto, InputMediaVideo, InputMediaAnimation,
+        InputMediaDocument, InputMediaAudio,
+    )
+
+    # Split media into album-eligible (photo/video/animation) and others
+    # (document/audio — Telegram doesn't allow them in send_media_group)
+    album_items = [m for m in media_items if m["type"] in ("photo", "video", "animation")]
+    other_items = [m for m in media_items if m["type"] not in ("photo", "video", "animation")]
+
+    sent_count = 0
+    failed = []
+
+    # Send album items in chunks of 10 (Telegram max per send_media_group)
+    if album_items:
+        # Use the first item's caption as the album caption (Telegram only
+        # shows the caption of the first item in a media group).
+        first_caption = album_items[0].get("caption") if album_items else None
+
+        for chunk_start in range(0, len(album_items), 10):
+            chunk = album_items[chunk_start:chunk_start + 10]
+            input_media = []
+            for i, item in enumerate(chunk):
+                # Only the first item of the FIRST chunk gets the caption
+                cap = first_caption if (chunk_start == 0 and i == 0) else None
+                if item["type"] == "photo":
+                    input_media.append(InputMediaPhoto(media=item["file_id"], caption=cap))
+                elif item["type"] == "video":
+                    input_media.append(InputMediaVideo(
+                        media=item["file_id"], caption=cap,
+                        supports_streaming=True,
+                    ))
+                elif item["type"] == "animation":
+                    input_media.append(InputMediaAnimation(
+                        media=item["file_id"], caption=cap,
+                    ))
+
+            try:
+                await context.bot.send_media_group(
+                    chat_id=dest_group_id,
+                    media=input_media,
+                    message_thread_id=topic_id,
+                )
+                sent_count += len(chunk)
+                logger.info("Album chunk sent: %d items to topic %d",
+                            len(chunk), topic_id)
+            except Exception as e:
+                logger.warning("send_media_group failed for chunk %d-%d: %s",
+                              chunk_start, chunk_start + len(chunk), e)
+                failed.append((chunk, e))
+
+    # Send other items (documents, audio) individually
+    for item in other_items:
+        try:
+            cap = item.get("caption")
+            if item["type"] == "document":
+                await context.bot.send_document(
+                    chat_id=dest_group_id,
+                    document=item["file_id"],
+                    caption=cap,
+                    message_thread_id=topic_id,
+                )
+            elif item["type"] == "audio":
+                await context.bot.send_audio(
+                    chat_id=dest_group_id,
+                    audio=item["file_id"],
+                    caption=cap,
+                    message_thread_id=topic_id,
+                )
+            sent_count += 1
+        except Exception as e:
+            logger.warning("send_%s failed: %s", item["type"], e)
+            failed.append(([item], e))
+
+    # Send text items as separate messages
+    for item in text_items:
+        try:
+            await context.bot.send_message(
+                chat_id=dest_group_id,
+                text=item["text"],
+                message_thread_id=topic_id,
+            )
+            sent_count += 1
+        except Exception as e:
+            logger.warning("send_message (text item) failed: %s", e)
+            failed.append(([item], e))
+
+    total = len(media_items) + len(text_items)
     logger.info("Album forward: %d/%d items sent to topic %d",
-                succeeded, len(results), topic_id)
+                sent_count, total, topic_id)
+
+    if failed and sent_count == 0:
+        # All failed — re-raise the first error so the user sees it
+        raise failed[0][1]
 
 
 async def _forward_link(context, payload, dest_group_id, topic_id) -> None:

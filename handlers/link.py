@@ -10,6 +10,7 @@ When the admin sends a t.me/c/<id>/<msg_id> or t.me/<channel>/<msg_id> URL:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -146,11 +147,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         kind="link",
     )
 
-    # Schedule cleanup of temp files after a generous window (30 min)
-    context.application.job_queue.run_once(
-        _cleanup_tmp, when=30 * 60, data={"dir": tmp_dir},
-        name=f"cleanup-{pending_id}",
-    )
+    # Schedule cleanup of temp files after 30 minutes.
+    #
+    # Previously used: context.application.job_queue.run_once(...)
+    # But job_queue is None in our custom webhook mode (PTB only initializes
+    # JobQueue when you call run_polling / run_webhook, AND only if the
+    # 'job-queue' extra is installed). This caused:
+    #   Internal error: 'NoneType' object has no attribute 'run_once'
+    # whenever a user sent a t.me link to a locked channel.
+    #
+    # Fix: just use asyncio.create_task + asyncio.sleep. Simpler, no
+    # extra dependencies, and works in both webhook and polling modes.
+    asyncio.create_task(_cleanup_tmp_later(tmp_dir, 30 * 60))
 
     # Show topic picker
     topics_mgr = context.bot_data["topics"]
@@ -265,13 +273,22 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
     return {"path": out_path, "type": media_type}
 
 
-async def _cleanup_tmp(context) -> None:
-    """JobQueue callback: remove temp dir after 30 min."""
-    job = context.job
-    if not job:
-        return
-    tmp_dir = job.data.get("dir") if job.data else None
-    if not tmp_dir:
+async def _cleanup_tmp_later(tmp_dir: str, delay_seconds: int) -> None:
+    """Wait `delay_seconds`, then delete the temp directory and all files in it.
+
+    Replacement for the old JobQueue-based cleanup. We use asyncio.sleep
+    because the PTB JobQueue is None in our custom webhook mode (PTB only
+    initializes it for run_polling / run_webhook, and only if the
+    'job-queue' extra is installed).
+
+    This is a fire-and-forget task scheduled via asyncio.create_task — the
+    caller doesn't await it. If the process exits before the delay elapses,
+    the cleanup doesn't run, but that's OK because we use /tmp which the
+    OS cleans up, and Render's filesystem is ephemeral anyway.
+    """
+    try:
+        await asyncio.sleep(delay_seconds)
+    except asyncio.CancelledError:
         return
     import shutil
     try:
