@@ -114,6 +114,15 @@ def build_application(cfg: Config, db: Database) -> Application:
         .token(cfg.bot_token)
         .post_init(post_init)
         .post_stop(post_stop)
+        # Enable concurrent update processing. Default is 1 (sequential) which
+        # means while one link is being fetched via Telethon (10-30 sec), the
+        # second link waits in the queue and only processes AFTER the first
+        # completes — the user sees the second link "ignored".
+        #
+        # With concurrent_updates=True (256 max), each update runs in its
+        # own asyncio task — so two links sent close together both fetch in
+        # parallel and the user sees two pickers.
+        .concurrent_updates(True)
         .build()
     )
     app.bot_data["config"] = cfg

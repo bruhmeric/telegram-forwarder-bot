@@ -110,15 +110,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status         — show bot status (Telethon, group, topics)\n"
         "/whoami         — show your Telegram user ID + admin status\n"
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
+        "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/cancel         — cancel the latest pending forward\n"
         "\n*Sending content*\n"
         "• Send me a photo / video / text / file -> I show topics (if forum) "
         "or a single Forward button (if not) -> tap to forward\n"
         "• Send me a t.me/c/<id>/<msg> link -> I fetch via your Telethon "
         "session and let you pick a destination\n"
+        "• `/saved <url>` -> skip the picker, send directly to Saved Messages "
+        "(fastest path)\n"
         "\n*Destination types*\n"
         "• Forum groups: pick a topic from the picker\n"
-        "• Regular groups/channels: single Forward button (no topic picker)",
+        "• Regular groups/channels: single Forward button (no topic picker)\n"
+        "• Saved Messages: use /saved command (bypass picker entirely)",
         parse_mode="Markdown",
     )
 
@@ -529,6 +533,119 @@ async def cmd_test_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await status_msg.edit_text(report, parse_mode="Markdown")
 
 
+async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a t.me link directly to Saved Messages via Telethon — FAST PATH.
+
+    This bypasses the topic picker entirely. The user account sends the
+    message to its own Saved Messages ("me" in Telethon), which is the
+    fastest destination because:
+      1. The user account is ALWAYS a member of its own Saved Messages
+      2. forward_messages or send_message works directly (no topic thread)
+      3. No need to wait for the user to tap a button
+
+    Usage: /saved https://t.me/c/1234567890/42
+    """
+    from user_session import parse_telegram_link
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/saved DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+    user_session = context.bot_data.get("user_session")
+    if not user_session or not user_session.available:
+        await update.effective_message.reply_text(
+            "❌ Telethon user session not available.\n"
+            "Run `python login.py --string` locally and set SESSION_STRING env var."
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/saved <t.me URL>`\n\n"
+            "Sends the content directly to your Saved Messages (fastest path — "
+            "no topic picker needed).\n\n"
+            "Example: `/saved https://t.me/c/1234567890/42`",
+            parse_mode="Markdown",
+        )
+        return
+
+    url = " ".join(context.args)
+    parsed = parse_telegram_link(url)
+    if not parsed:
+        await update.effective_message.reply_text(
+            f"❌ Could not parse URL: `{url}`\n\n"
+            f"Supported formats:\n"
+            f"  • `https://t.me/c/1234567890/42`  (private channel post)\n"
+            f"  • `https://t.me/channelname/42`   (public channel post)",
+            parse_mode="Markdown",
+        )
+        return
+
+    status_msg = await update.effective_message.reply_text(
+        f"📩 Sending to Saved Messages...\n\n"
+        f"Source: `{parsed.chat_ref}` / msg `{parsed.message_id}`",
+        parse_mode="Markdown",
+    )
+
+    # Build a progress callback that updates the status message
+    import time as _time
+    last_update = {"time": 0.0, "text": "", "first": True}
+
+    async def progress_cb(sent_bytes: int, total_bytes: int, label: str):
+        now = _time.time()
+        if total_bytes > 0:
+            pct = (sent_bytes / total_bytes) * 100
+            sent_mb = sent_bytes / (1024 * 1024)
+            total_mb = total_bytes / (1024 * 1024)
+            text = (f"📡 {label}\n\n"
+                    f"Progress: {pct:.1f}%\n"
+                    f"{sent_mb:.2f} / {total_mb:.2f} MB")
+        else:
+            text = f"📡 {label}..."
+
+        if text == last_update["text"]:
+            return
+
+        if not last_update["first"]:
+            if now - last_update["time"] < 0.5:
+                return
+        last_update["first"] = False
+        last_update["time"] = now
+        last_update["text"] = text
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            pass
+
+    try:
+        # Send to "me" — Telethon's special entity for Saved Messages.
+        # This is a direct call to send_to_destination with dest_chat_id="me"
+        # which Telethon resolves to the user's own Saved Messages chat.
+        success, diag = await user_session.send_to_destination(
+            source_chat_id=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
+            source_message_ids=[parsed.message_id],
+            dest_chat_id="me",  # Saved Messages
+            topic_id=None,
+            progress_callback=progress_cb,
+        )
+    except Exception as e:
+        logger.exception("/saved failed")
+        await status_msg.edit_text(
+            f"❌ Exception: `{type(e).__name__}: {e}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if success:
+        await status_msg.edit_text("✅ Sent to Saved Messages!")
+    else:
+        err_lines = "\n".join(diag[-7:])
+        await status_msg.edit_text(
+            f"❌ Failed to send to Saved Messages.\n\n"
+            f"Last diagnostic steps:\n{err_lines}",
+        )
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.bot_data["config"]
     db = context.bot_data["db"]
@@ -571,4 +688,5 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("test_link", cmd_test_link))
+    app.add_handler(CommandHandler("saved", cmd_saved))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
