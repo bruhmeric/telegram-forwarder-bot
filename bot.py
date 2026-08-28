@@ -124,12 +124,20 @@ def build_application(cfg: Config, db: Database) -> Application:
     # silently swallowed by PTB and the user sees no reply (the
     # "/setgroup does nothing" symptom).
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.exception("Unhandled exception in handler for update: %s", update)
-        # Try to notify the user that something went wrong — but only for
-        # updates that have an effective_chat / effective_message
+        # Log the full traceback (logger.exception uses context.error info
+        # automatically when called inside a handler — but to be safe, we
+        # also log it explicitly)
+        error = context.error if hasattr(context, "error") else None
+        if error:
+            logger.error("🚨 Unhandled exception in handler for update %s: %s",
+                         update, type(error).__name__, exc_info=error)
+        else:
+            logger.error("🚨 Unhandled exception in handler for update %s (no error info)", update)
+
+        # Try to notify the user that something went wrong
         try:
             if isinstance(update, Update) and update.effective_message:
-                err_str = str(context.error)[:500] if context.error else "unknown"
+                err_str = str(error)[:500] if error else "unknown error"
                 await update.effective_message.reply_text(
                     f"Internal error: {err_str}\n\n"
                     f"Check the bot logs for details."
@@ -201,38 +209,48 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
     # directly. PTB docs explicitly state:
     #   "Does not call post_init - that is only done by run_polling and run_webhook."
     #
-    # post_init does:
-    #   - db.init()  -> creates SQLite tables (without this, every command
-    #                  that touches DB throws "no such table" silently)
-    #   - UserSession.start() -> connects Telethon
-    #   - TopicManager setup
+    # PTB's official run_webhook order is:
+    #   1. initialize
+    #   2. post_init
+    #   3. updater.start_webhook (calls set_webhook)
+    #   4. start
+    #   5. run_forever
     #
-    # This was the root cause of "/setgroup does nothing but /start works":
-    # /start just sends a hardcoded reply (no DB access), while /setgroup
-    # needs db.set_runtime(), which fails because db.init() never ran.
-    # The exception was swallowed silently — user saw no reply.
+    # We mirror this order exactly:
+    #   1. app.initialize()
+    #   2. post_init(app)            (DB tables, Telethon, TopicManager)
+    #   3. app.bot.set_webhook(...)
+    #   4. app.start()                (starts update fetcher)
+    #   5. Start aiohttp server
+    #   6. asyncio.Event().wait()     (run forever)
     #
-    # Order matters: we must call app.initialize() FIRST (so app.bot.get_me()
-    # inside post_init works), then post_init, then app.start().
+    # Previously I had app.start() BEFORE set_webhook, which is the wrong
+    # order. The exact ordering may not matter functionally, but matching
+    # PTB's official order is safer and more correct.
 
     # Step 1: initialize the PTB app (handlers, bot, updater)
-    logger.info("Initializing PTB application (webhook mode)...")
+    logger.info("[step 1/5] Initializing PTB application...")
     await app.initialize()
 
     # Step 2: run post_init manually (DB tables, Telethon, TopicManager)
-    logger.info("Running post_init manually (webhook mode)...")
+    logger.info("[step 2/5] Running post_init manually (DB init, Telethon, TopicManager)...")
     await post_init(app)
 
-    # Step 3: start the app (begins processing updates)
-    await app.start()
-
-    # Register the webhook URL with Telegram (replaces PTB's run_webhook call)
+    # Step 3: register webhook URL with Telegram (BEFORE app.start, per PTB order)
+    logger.info("[step 3/5] Registering webhook URL with Telegram: %s", full_webhook_url)
     await app.bot.set_webhook(
         url=full_webhook_url,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,  # keep pending updates — they'll arrive
     )
-    logger.info("Webhook registered with Telegram: %s", full_webhook_url)
+    logger.info("✓ Webhook registered with Telegram")
+
+    # Step 4: start the app (begins processing updates)
+    logger.info("[step 4/5] Starting Application (update fetcher)...")
+    await app.start()
+
+    # Step 5: start the aiohttp server (accepts webhook HTTP requests)
+    logger.info("[step 5/5] Starting aiohttp webhook server on port %d...", cfg.port)
 
     # ----- aiohttp handlers -----
 
@@ -243,6 +261,8 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
     async def webhook_handler(request: web.Request) -> web.Response:
         """Receive an update from Telegram, dispatch to PTB's process_update."""
         if request.path != f"/{url_path}":
+            logger.warning("webhook_handler: 404 — request.path=%r, expected=%r",
+                          request.path, f"/{url_path}")
             return web.Response(status=404)
         try:
             data = await request.json()
@@ -252,7 +272,18 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
         try:
             update = Update.de_json(data, app.bot)
             if update is None:
+                logger.warning("webhook_handler: Update.de_json returned None")
                 return web.Response(status=400, text="Could not parse update")
+            # Log the incoming update for debugging
+            update_id = data.get("update_id", "?")
+            msg = data.get("message") or data.get("callback_query", {}).get("message")
+            if msg and isinstance(msg, dict):
+                text = msg.get("text") or msg.get("caption") or ""
+                chat_id = msg.get("chat", {}).get("id")
+                logger.info("📨 Incoming update_id=%s chat=%s text=%r",
+                            update_id, chat_id, text[:80] if text else "(no text)")
+            else:
+                logger.info("📨 Incoming update_id=%s (non-message)", update_id)
             # Schedule the update in the background — return 200 immediately
             # so Telegram doesn't think the bot is slow.
             asyncio.create_task(app.process_update(update))
