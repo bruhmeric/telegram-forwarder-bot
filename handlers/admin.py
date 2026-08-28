@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import unicodedata
 
 from telegram import Update
@@ -111,6 +112,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/whoami         — show your Telegram user ID + admin status\n"
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
+        "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
+        "/stop_scrape    — 🛑 stop the active scrape\n"
+        "/scrape_status  — 📊 check scrape progress\n"
         "/cancel         — cancel the latest pending forward\n"
         "\n*Sending content*\n"
         "• Send me a photo / video / text / file -> I show topics (if forum) "
@@ -119,10 +123,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "session and let you pick a destination\n"
         "• `/saved <url>` -> skip the picker, send directly to Saved Messages "
         "(fastest path)\n"
+        "• `/scrape <url>` -> scrape the entire channel and auto-send all "
+        "media to your destination\n"
+        "\n*Scrape flags*\n"
+        "  `old` — oldest first (chronological)\n"
+        "  `saved` — send to Saved Messages (default: destination group)\n"
+        "  Example: `/scrape https://t.me/c/123 saved old`\n"
         "\n*Destination types*\n"
         "• Forum groups: pick a topic from the picker\n"
         "• Regular groups/channels: single Forward button (no topic picker)\n"
-        "• Saved Messages: use /saved command (bypass picker entirely)",
+        "• Saved Messages: use /saved or /scrape saved",
         parse_mode="Markdown",
     )
 
@@ -646,6 +656,232 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scrape a channel — send all media (photos/videos) to destination.
+
+    Usage:
+      /scrape <channel_url>              — newest first, send to destination group
+      /scrape <channel_url> old           — oldest first (chronological order)
+      /scrape <channel_url> saved        — send to Saved Messages (fastest)
+      /scrape <channel_url> saved old    — Saved Messages, oldest first
+
+    Examples:
+      /scrape https://t.me/publicchannel
+      /scrape https://t.me/c/1234567890
+      /scrape https://t.me/c/1234567890 saved old
+
+    The scrape runs in the background. Use /stop_scrape to stop it,
+    /scrape_status to check progress.
+
+    Notes:
+      - Only photos, videos, animations, documents, audio are forwarded
+      - Text-only messages are skipped
+      - Rate limit: 0.3 sec delay between sends (3 msgs/sec)
+      - On FloodWait, the bot sleeps and retries automatically
+      - Protected (noforwards) channels use the same three-tier fallback
+        as /saved — forward → send_message(file=) → download+send_file
+    """
+    import asyncio
+    from user_session import parse_channel_link, parse_telegram_link
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/scrape DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+    user_session = context.bot_data.get("user_session")
+    if not user_session or not user_session.available:
+        await update.effective_message.reply_text(
+            "❌ Telethon user session not available.\n"
+            "Run `python login.py --string` locally and set SESSION_STRING env var."
+        )
+        return
+
+    # Check if there's already an active scrape
+    if context.bot_data.get("scrape_task") and not context.bot_data["scrape_task"].done():
+        await update.effective_message.reply_text(
+            "⚠️ A scrape is already running. Use /stop_scrape to stop it first, "
+            "or /scrape_status to check progress."
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "  `/scrape <channel_url>` — newest first\n"
+            "  `/scrape <channel_url> old` — oldest first\n"
+            "  `/scrape <channel_url> saved` — send to Saved Messages\n"
+            "  `/scrape <channel_url> saved old` — both options\n\n"
+            "Examples:\n"
+            "  `/scrape https://t.me/publicchannel`\n"
+            "  `/scrape https://t.me/c/1234567890 saved old`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Parse args: first arg is URL, rest are flags
+    url = context.args[0]
+    flags = [a.lower() for a in context.args[1:]]
+    send_to_saved = "saved" in flags
+    oldest_first = "old" in flags or "oldest" in flags
+
+    # Try parsing as a channel-only link first, then fall back to a post link
+    parsed = parse_channel_link(url)
+    if not parsed:
+        # Maybe they passed a post link (t.me/c/123/42) — extract the channel part
+        parsed_post = parse_telegram_link(url)
+        if parsed_post:
+            # Use the same chat_ref but message_id=0 (whole channel)
+            parsed = type(parsed_post)(kind=parsed_post.kind,
+                                        chat_ref=parsed_post.chat_ref,
+                                        message_id=0)
+    if not parsed:
+        await update.effective_message.reply_text(
+            f"❌ Could not parse URL: `{url}`\n\n"
+            f"Supported formats:\n"
+            f"  • `https://t.me/c/1234567890`  (private channel)\n"
+            f"  • `https://t.me/channelname`   (public channel)\n"
+            f"  • `https://t.me/c/1234567890/42`  (private channel + start msg)\n"
+            f"  • `https://t.me/channelname/42`   (public channel + start msg)",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Determine destination
+    if send_to_saved:
+        dest_chat_id = "me"
+        dest_label = "Saved Messages"
+    else:
+        db = context.bot_data["db"]
+        dest_chat_id = cfg.destination_group_id
+        if dest_chat_id is None:
+            v = await db.get_runtime("destination_group_id")
+            dest_chat_id = int(v) if v else None
+        if dest_chat_id is None:
+            await update.effective_message.reply_text(
+                "No destination group set. Either:\n"
+                "  • /setgroup <group_id> first, OR\n"
+                "  • Use /scrape <url> saved — to send to Saved Messages"
+            )
+            return
+        dest_label = f"chat {dest_chat_id}"
+
+    # Initial status message
+    status_msg = await update.effective_message.reply_text(
+        f"🔍 Starting scrape...\n\n"
+        f"Source: `{parsed.chat_ref}`\n"
+        f"Destination: {dest_label}\n"
+        f"Order: {'oldest first' if oldest_first else 'newest first'}\n\n"
+        f"_Use /stop_scrape to cancel, /scrape_status to check progress._",
+        parse_mode="Markdown",
+    )
+
+    # Set up cancellation event and status storage
+    cancel_event = asyncio.Event()
+    context.bot_data["scrape_cancel"] = cancel_event
+    context.bot_data["scrape_status"] = {
+        "sent_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "total_seen": 0,
+        "last_message_id": 0,
+        "started_at": time.time(),
+        "source_ref": parsed.chat_ref,
+        "dest_label": dest_label,
+        "order": "oldest" if oldest_first else "newest",
+    }
+
+    # Build the status callback that edits the status message AND updates
+    # context.bot_data["scrape_status"]
+    last_status_text = {"value": ""}
+
+    async def status_callback(text: str):
+        # Throttle status edits to ~1 per 5s (the scrape_channel itself
+        # already throttles to 5s, but we double-check here)
+        if text == last_status_text["value"]:
+            return
+        last_status_text["value"] = text
+        # Update bot_data status
+        context.bot_data["scrape_status"].update({
+            "last_update": time.time(),
+        })
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            pass  # rate-limited or message unchanged
+
+    # Run the scrape as a background task
+    async def scrape_task():
+        try:
+            await user_session.scrape_channel(
+                source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
+                dest_chat_id=dest_chat_id,
+                topic_id=None,  # scraper doesn't support topics yet (use /saved for that)
+                reverse=oldest_first,
+                cancel_event=cancel_event,
+                status_callback=status_callback,
+            )
+        except Exception as e:
+            logger.exception("/scrape task failed")
+            try:
+                await status_msg.edit_text(f"❌ Scrape crashed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+        finally:
+            # Clean up the scrape state when done
+            context.bot_data.pop("scrape_task", None)
+            context.bot_data.pop("scrape_cancel", None)
+
+    context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
+    logger.info("Scrape started for %s -> %s", parsed.chat_ref, dest_label)
+
+
+async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop the currently running scrape."""
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        return
+    cancel_event = context.bot_data.get("scrape_cancel")
+    task = context.bot_data.get("scrape_task")
+    if not task or task.done():
+        await update.effective_message.reply_text("No active scrape to stop.")
+        return
+    # Set the cancel event — the scrape loop will pick it up on next iteration
+    if cancel_event:
+        cancel_event.set()
+    await update.effective_message.reply_text(
+        "🛑 Stop signal sent. The scrape will stop after the current message "
+        "(within a few seconds). Use /scrape_status to see final stats."
+    )
+
+
+async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the current scrape status."""
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        return
+    status = context.bot_data.get("scrape_status")
+    task = context.bot_data.get("scrape_task")
+    if not status:
+        await update.effective_message.reply_text("No scrape has been started yet.")
+        return
+    running = task and not task.done()
+    elapsed = time.time() - status.get("started_at", 0) if status.get("started_at") else 0
+    state_str = "🟢 running" if running else "🔴 finished"
+    await update.effective_message.reply_text(
+        f"📊 Scrape status: {state_str}\n\n"
+        f"Source: `{status.get('source_ref', '?')}`\n"
+        f"Destination: {status.get('dest_label', '?')}\n"
+        f"Order: {status.get('order', '?')}\n"
+        f"Elapsed: {elapsed:.0f} sec\n\n"
+        f"Total seen: {status.get('total_seen', 0)}\n"
+        f"Sent: {status.get('sent_count', 0)}\n"
+        f"Failed: {status.get('failed_count', 0)}\n"
+        f"Skipped (no media): {status.get('skipped_count', 0)}\n"
+        f"Last msg ID: {status.get('last_message_id', 0)}",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.bot_data["config"]
     db = context.bot_data["db"]
@@ -689,4 +925,7 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("test_link", cmd_test_link))
     app.add_handler(CommandHandler("saved", cmd_saved))
+    app.add_handler(CommandHandler("scrape", cmd_scrape))
+    app.add_handler(CommandHandler("stop_scrape", cmd_stop_scrape))
+    app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))

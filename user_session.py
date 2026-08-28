@@ -74,6 +74,45 @@ def parse_telegram_link(url: str) -> Optional[ParsedLink]:
     return None
 
 
+# Regex for channel-only links (no message_id):
+# https://t.me/c/1234567890  (private channel, no msg_id)
+# https://t.me/channelname   (public channel, no msg_id)
+PRIVATE_CHANNEL_ONLY_RE = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/c/(\d+)/?$",
+    re.IGNORECASE,
+)
+PUBLIC_CHANNEL_ONLY_RE = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/([A-Za-z][A-Za-z0-9_]{3,})/?$",
+    re.IGNORECASE,
+)
+
+
+def parse_channel_link(url: str) -> Optional[ParsedLink]:
+    """Parse a channel-only link (no message_id) — used by /scrape.
+
+    Returns a ParsedLink with message_id=0 (signaling "no specific message")
+    or None if the URL doesn't match.
+    """
+    url = url.strip()
+    # Strip any trailing query string or fragment
+    url = url.split("?")[0].split("#")[0]
+
+    m = PRIVATE_CHANNEL_ONLY_RE.match(url)
+    if m:
+        raw_id = int(m.group(1))
+        chat_id = -1_000_000_000_000 - raw_id
+        return ParsedLink(kind="private", chat_ref=str(chat_id), message_id=0)
+
+    m = PUBLIC_CHANNEL_ONLY_RE.match(url)
+    if m:
+        username = m.group(1)
+        if username.lower() in ("joinchat", "share", "addstickers", "setlanguage"):
+            return None
+        return ParsedLink(kind="public", chat_ref=username, message_id=0)
+
+    return None
+
+
 # ---------- session manager ----------
 
 class UserSession:
@@ -933,9 +972,230 @@ class UserSession:
 
         return media_paths, caption, text_only, diag
 
+    # ---------- channel scraping ----------
+
+    async def scrape_channel(
+        self,
+        source_chat_ref,
+        dest_chat_id,
+        topic_id: int | None = None,
+        reverse: bool = False,
+        min_id: int = 0,
+        max_id: int = 0,
+        cancel_event=None,
+        progress_callback=None,
+        status_callback=None,
+    ) -> dict:
+        """Iterate all messages in a channel and forward each media message
+        to the destination chat. Used by the /scrape command.
+
+        Args:
+          source_chat_ref: chat_id (int) or username (str) of the source channel
+          dest_chat_id: destination chat_id (int) or "me" for Saved Messages
+          topic_id: optional topic thread (for forum destinations)
+          reverse: if True, oldest first (default: newest first)
+          min_id: skip messages with id <= min_id
+          max_id: skip messages with id > max_id (or 0 for no upper bound)
+          cancel_event: asyncio.Event — set to cancel scraping
+          progress_callback: async callable(sent, total_seen, last_msg_id, label)
+          status_callback: async callable(status_text) — for status updates
+
+        Returns:
+          dict with keys: sent_count, failed_count, skipped_count,
+                          total_seen, last_message_id, cancelled (bool)
+
+        Rate limiting:
+          - 0.3 sec delay between sends (about 3 msgs/sec — safe for Telegram)
+          - On FloodWaitError, sleep for the requested seconds + 5s buffer
+        """
+        from telethon.errors import FloodWaitError
+
+        result = {
+            "sent_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,  # text-only or no-media messages
+            "total_seen": 0,
+            "last_message_id": 0,
+            "cancelled": False,
+            "flood_waits": 0,
+        }
+
+        try:
+            source_entity = await self.client.get_entity(source_chat_ref)
+            dest_entity = await self.client.get_entity(dest_chat_id)
+        except Exception as e:
+            if status_callback:
+                await status_callback(f"❌ Failed to resolve entities: {type(e).__name__}: {e}")
+            result["failed_count"] = -1  # signal error
+            return result
+
+        if status_callback:
+            await status_callback(
+                f"🔍 Scraping channel: {getattr(source_entity, 'title', source_chat_ref)}\n"
+                f"   → destination: {getattr(dest_entity, 'title', dest_chat_id)}"
+                f"{f' (topic {topic_id})' if topic_id else ''}\n"
+                f"   order: {'oldest first' if reverse else 'newest first'}"
+            )
+
+        # Build kwargs for iter_messages
+        iter_kwargs = {
+            "reverse": reverse,
+            "limit": None,  # iterate ALL messages (use async iterator)
+        }
+        if min_id > 0:
+            iter_kwargs["min_id"] = min_id
+        if max_id > 0:
+            iter_kwargs["max_id"] = max_id
+
+        # Statistics for status updates
+        last_status_time = 0
+        status_interval = 5.0  # update status every 5 seconds
+
+        try:
+            async for msg in self.client.iter_messages(source_entity, **iter_kwargs):
+                # Check for cancellation
+                if cancel_event and cancel_event.is_set():
+                    result["cancelled"] = True
+                    if status_callback:
+                        await status_callback(
+                            f"🛑 Scraping cancelled by user.\n"
+                            f"   Sent: {result['sent_count']}, "
+                            f"Failed: {result['failed_count']}, "
+                            f"Skipped: {result['skipped_count']}"
+                        )
+                    break
+
+                result["total_seen"] += 1
+                result["last_message_id"] = msg.id
+
+                # Skip messages without media (text-only)
+                if not msg.media:
+                    result["skipped_count"] += 1
+                    # Periodic status update
+                    import time as _time
+                    now = _time.time()
+                    if status_callback and now - last_status_time > status_interval:
+                        last_status_time = now
+                        await status_callback(
+                            f"📊 Scraping in progress...\n\n"
+                            f"Total seen: {result['total_seen']}\n"
+                            f"Sent: {result['sent_count']}\n"
+                            f"Failed: {result['failed_count']}\n"
+                            f"Skipped (no media): {result['skipped_count']}\n"
+                            f"Last msg ID: {result['last_message_id']}"
+                        )
+                    continue
+
+                # Skip non-media types (web pages, contacts, geos, polls, etc.)
+                # We only want photos, videos, animations, documents, audio.
+                if isinstance(msg.media, (
+                    tl.MessageMediaWebPage, tl.MessageMediaContact,
+                    tl.MessageMediaGeo, tl.MessageMediaVenue,
+                    tl.MessageMediaGame, tl.MessageMediaPoll,
+                    tl.MessageMediaUnsupported,
+                )):
+                    result["skipped_count"] += 1
+                    continue
+
+                # Send this message to destination via the same three-tier
+                # fallback used by send_to_destination.
+                try:
+                    success, _diag = await self.send_to_destination(
+                        source_chat_id=source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id,
+                        source_message_ids=[msg.id],
+                        dest_chat_id=dest_chat_id,
+                        topic_id=topic_id,
+                        progress_callback=None,  # don't show per-msg progress during scrape
+                    )
+                    if success:
+                        result["sent_count"] += 1
+                    else:
+                        result["failed_count"] += 1
+                except FloodWaitError as e:
+                    # Telegram is asking us to slow down
+                    result["flood_waits"] += 1
+                    wait_seconds = e.seconds + 5  # add 5s buffer
+                    if status_callback:
+                        await status_callback(
+                            f"⏳ Flood wait: sleeping {wait_seconds}s before retrying...\n"
+                            f"   Sent so far: {result['sent_count']}"
+                        )
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(wait_seconds)
+                    # Retry this message once
+                    try:
+                        success, _ = await self.send_to_destination(
+                            source_chat_id=source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id,
+                            source_message_ids=[msg.id],
+                            dest_chat_id=dest_chat_id,
+                            topic_id=topic_id,
+                            progress_callback=None,
+                        )
+                        if success:
+                            result["sent_count"] += 1
+                        else:
+                            result["failed_count"] += 1
+                    except Exception:
+                        result["failed_count"] += 1
+                except Exception as e:
+                    logger.warning("scrape: failed to send msg %d: %s", msg.id, e)
+                    result["failed_count"] += 1
+
+                # Progress callback (for per-message progress)
+                if progress_callback:
+                    try:
+                        await progress_callback(
+                            result["sent_count"],
+                            result["total_seen"],
+                            result["last_message_id"],
+                            f"Sent {result['sent_count']} / seen {result['total_seen']}",
+                        )
+                    except Exception:
+                        pass
+
+                # Periodic status update
+                import time as _time
+                now = _time.time()
+                if status_callback and now - last_status_time > status_interval:
+                    last_status_time = now
+                    await status_callback(
+                        f"📊 Scraping in progress...\n\n"
+                        f"Total seen: {result['total_seen']}\n"
+                        f"Sent: {result['sent_count']}\n"
+                        f"Failed: {result['failed_count']}\n"
+                        f"Skipped (no media): {result['skipped_count']}\n"
+                        f"Last msg ID: {result['last_message_id']}"
+                    )
+
+                # Rate limit: small delay between sends
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.3)
+
+        except Exception as e:
+            logger.exception("scrape_channel: iter_messages failed")
+            if status_callback:
+                await status_callback(f"❌ Scrape error: {type(e).__name__}: {e}")
+            result["failed_count"] = -1
+            return result
+
+        # Final status
+        if status_callback and not result["cancelled"]:
+            await status_callback(
+                f"✅ Scraping complete!\n\n"
+                f"Total seen: {result['total_seen']}\n"
+                f"Sent: {result['sent_count']}\n"
+                f"Failed: {result['failed_count']}\n"
+                f"Skipped (no media): {result['skipped_count']}\n"
+                f"Flood waits: {result['flood_waits']}\n"
+                f"Last msg ID: {result['last_message_id']}"
+            )
+
+        return result
+
 
 __all__ = [
     "UserSession",
     "ParsedLink",
     "parse_telegram_link",
+    "parse_channel_link",
 ]
