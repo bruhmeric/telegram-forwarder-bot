@@ -549,6 +549,31 @@ class UserSession:
                             return progress_callback(sent_bytes, total_bytes, label)
                     return _cb
 
+                # ----- Helper: download thumbnail (if available) -----
+                async def _download_thumbnail(msg_media, thumb_dir: str, idx: int):
+                    """Download the thumbnail for a video/document as a JPEG.
+                    Returns the path to the .jpg file, or None if no thumb.
+
+                    Telegram documents have a `thumbs` list (PhotoSize
+                    objects). The largest is typically a small JPEG used as
+                    the video poster / preview. We download it via Telethon's
+                    `download_media(msg, file=bytes, thumb=-1)` which uses
+                    Telethon's _get_thumb to pick the largest size.
+                    """
+                    try:
+                        thumb_bytes = await self.client.download_media(
+                            msg_media, file=bytes, thumb=-1,
+                        )
+                        if not thumb_bytes:
+                            return None
+                        thumb_path = os.path.join(thumb_dir, f"thumb_{idx}.jpg")
+                        with open(thumb_path, "wb") as f:
+                            f.write(thumb_bytes)
+                        return thumb_path
+                    except Exception as e:
+                        diag.append(f"  • (thumbnail download skipped: {type(e).__name__})")
+                        return None
+
                 # ----- Photos: MessageMediaPhoto -----
                 if isinstance(msg.media, tl_types.MessageMediaPhoto):
                     out_path = os.path.join(tmp_dir, f"photo_{i+1}_{int(time.time())}.jpg")
@@ -653,33 +678,84 @@ class UserSession:
                     force_document = not (is_video or is_audio or
                                           is_animation or is_image_doc)
 
-                    # Download to disk
+                    # Download to disk with LARGER CHUNK SIZE for speed.
+                    # Telethon's auto-picker uses 128KB for <100MB files,
+                    # which is 4x smaller than the 512KB max. Each chunk is a
+                    # separate network round-trip, so 4x smaller = 4x slower.
+                    # We bypass the auto-picker by calling _download_file with
+                    # part_size_kb=512 (4x speedup).
                     out_path = os.path.join(tmp_dir, original_filename)
                     dl_cb = make_progress_cb(i, len(messages), "Downloading", original_filename)
                     try:
-                        result = await self.client.download_media(
-                            msg, file=out_path, progress_callback=dl_cb,
+                        # Use Telethon's _download_file directly with a large
+                        # chunk size for faster download. The InputDocumentFileLocation
+                        # is what Telethon would use internally for documents.
+                        from telethon.tl.types import InputDocumentFileLocation
+                        thumb_size_type = ""  # main file, not a thumb
+                        file_location = InputDocumentFileLocation(
+                            id=doc.id,
+                            access_hash=doc.access_hash,
+                            file_reference=doc.file_reference,
+                            thumb_size=thumb_size_type,
                         )
-                        if not result:
-                            diag.append(f"✗ Could not download media for message {i+1}")
-                            continue
-                        if isinstance(result, bytes):
-                            with open(out_path, "wb") as f:
-                                f.write(result)
-                        else:
-                            out_path = str(result)
+                        await self.client._download_file(
+                            file_location,
+                            out_path,
+                            part_size_kb=512,  # 4x larger than auto-picked 128KB
+                            file_size=doc.size,
+                            progress_callback=dl_cb,
+                        )
                         sz = os.path.getsize(out_path)
                         diag.append(f"  • Downloaded {original_filename} "
                                     f"({sz/1024/1024:.1f} MB, mime={original_mime})")
                     except Exception as e:
                         diag.append(f"✗ Failed to download media {i+1}: "
                                     f"{type(e).__name__}: {e}")
-                        continue
+                        # Fallback: try the regular download_media
+                        try:
+                            diag.append(f"  → Retrying with regular download_media()...")
+                            result = await self.client.download_media(
+                                msg, file=out_path, progress_callback=dl_cb,
+                            )
+                            if not result:
+                                continue
+                            sz = os.path.getsize(out_path)
+                            diag.append(f"  • Downloaded (fallback) {original_filename} "
+                                        f"({sz/1024/1024:.1f} MB)")
+                        except Exception as e2:
+                            diag.append(f"✗ Fallback download also failed: {type(e2).__name__}: {e2}")
+                            continue
 
-                    # Send the file with preserved attributes + supports_streaming
+                    # Download the thumbnail (for videos). The thumb is a small
+                    # JPEG that Telegram shows as the video poster before play.
+                    # Without it, the destination video has no preview/thumbnail.
+                    thumb_path = None
+                    if is_video and getattr(doc, "thumbs", None):
+                        thumb_path = await _download_thumbnail(msg, tmp_dir, i)
+                        if thumb_path:
+                            try:
+                                tsize = os.path.getsize(thumb_path)
+                                diag.append(f"  • Downloaded thumbnail ({tsize/1024:.1f} KB)")
+                            except OSError:
+                                pass
+
+                    # Send the file with preserved attributes + thumbnail +
+                    # supports_streaming. We PRE-UPLOAD the file with a large
+                    # chunk size (512KB max) for 4x speedup vs Telethon's
+                    # auto-picker, then pass the resulting InputFile to send_file.
                     try:
+                        ul_cb = make_progress_cb(i, len(messages), "Uploading", original_filename)
+                        # Pre-upload with max chunk size for speed.
+                        # Telethon's upload_file enforces part_size_kb <= 512.
+                        file_handle = await self.client.upload_file(
+                            out_path,
+                            part_size_kb=512,  # max allowed, 4x faster than auto 128KB
+                            file_size=os.path.getsize(out_path),
+                            progress_callback=ul_cb,
+                        )
+
                         send_kwargs = dict(
-                            file=out_path,
+                            file=file_handle,  # already-uploaded InputFile — send_file skips re-upload
                             caption=msg.message if i == 0 else "",
                             formatting_entities=msg.entities if i == 0 else None,
                             # Pass the original attributes (minus Filename)
@@ -688,6 +764,10 @@ class UserSession:
                             mime_type=original_mime,
                             force_document=force_document,
                         )
+                        # KEY FIX: Pass the downloaded thumbnail so the
+                        # destination video shows a poster/preview image.
+                        if thumb_path:
+                            send_kwargs["thumb"] = thumb_path
                         # KEY FIX: Pass supports_streaming=True for videos
                         # so Telegram shows it as a streamable video.
                         if is_video:
@@ -705,14 +785,13 @@ class UserSession:
                                 reply_to_top_id=topic_id,
                                 reply_to_msg_id=topic_id,
                             )
-                        ul_cb = make_progress_cb(i, len(messages), "Uploading", original_filename)
-                        await self.client.send_file(
-                            dest_entity, progress_callback=ul_cb, **send_kwargs,
-                        )
+                        await self.client.send_file(dest_entity, **send_kwargs)
                         sent_count += 1
                         if is_video:
+                            thumb_msg = " with thumbnail" if thumb_path else " (no thumbnail)"
                             diag.append(f"✓ Sent re-uploaded video {i+1}/{len(messages)} "
-                                        f"(playable, streaming, with duration/dims)")
+                                        f"(playable, streaming{thumb_msg}, "
+                                        f"duration/dims preserved)")
                         elif is_audio:
                             diag.append(f"✓ Sent re-uploaded audio {i+1}/{len(messages)}")
                         elif is_animation:
