@@ -119,6 +119,26 @@ def build_application(cfg: Config, db: Database) -> Application:
     app.bot_data["config"] = cfg
     app.bot_data["db"] = db
 
+    # Global error handler — any exception thrown by a handler that isn't
+    # caught will land here. Without this, exceptions in handlers are
+    # silently swallowed by PTB and the user sees no reply (the
+    # "/setgroup does nothing" symptom).
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("Unhandled exception in handler for update: %s", update)
+        # Try to notify the user that something went wrong — but only for
+        # updates that have an effective_chat / effective_message
+        try:
+            if isinstance(update, Update) and update.effective_message:
+                err_str = str(context.error)[:500] if context.error else "unknown"
+                await update.effective_message.reply_text(
+                    f"Internal error: {err_str}\n\n"
+                    f"Check the bot logs for details."
+                )
+        except Exception:
+            pass  # don't recurse
+
+    app.add_error_handler(on_error)
+
     register_admin_handlers(app)
 
     # IMPORTANT: both MessageHandlers MUST be in the same group with mutually
@@ -175,8 +195,35 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
     url_path = cfg.webhook_url_path
     full_webhook_url = f"{cfg.webhook_url.rstrip('/')}/{url_path}"
 
-    # Manually initialize the app (handlers, post_init, etc.)
+    # CRITICAL: We must call post_init MANUALLY because we're bypassing PTB's
+    # run_webhook() / run_polling(). In PTB v21, post_init is invoked by
+    # run_polling/run_webhook but NOT by app.initialize() / app.start()
+    # directly. PTB docs explicitly state:
+    #   "Does not call post_init - that is only done by run_polling and run_webhook."
+    #
+    # post_init does:
+    #   - db.init()  -> creates SQLite tables (without this, every command
+    #                  that touches DB throws "no such table" silently)
+    #   - UserSession.start() -> connects Telethon
+    #   - TopicManager setup
+    #
+    # This was the root cause of "/setgroup does nothing but /start works":
+    # /start just sends a hardcoded reply (no DB access), while /setgroup
+    # needs db.set_runtime(), which fails because db.init() never ran.
+    # The exception was swallowed silently — user saw no reply.
+    #
+    # Order matters: we must call app.initialize() FIRST (so app.bot.get_me()
+    # inside post_init works), then post_init, then app.start().
+
+    # Step 1: initialize the PTB app (handlers, bot, updater)
+    logger.info("Initializing PTB application (webhook mode)...")
     await app.initialize()
+
+    # Step 2: run post_init manually (DB tables, Telethon, TopicManager)
+    logger.info("Running post_init manually (webhook mode)...")
+    await post_init(app)
+
+    # Step 3: start the app (begins processing updates)
     await app.start()
 
     # Register the webhook URL with Telegram (replaces PTB's run_webhook call)
@@ -246,6 +293,12 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
             await app.bot.delete_webhook()
         except Exception:
             pass
+        # Call post_stop manually (mirror of post_init — would normally be
+        # called by run_webhook/run_polling)
+        try:
+            await post_stop(app)
+        except Exception:
+            logger.exception("post_stop failed")
         await app.stop()
         await app.shutdown()
 
