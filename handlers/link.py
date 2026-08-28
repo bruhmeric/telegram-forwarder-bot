@@ -65,19 +65,34 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     status = await update.effective_message.reply_text(
-        f"Fetching message from {parsed.chat_ref} / {parsed.message_id} ..."
+        f"🔗 Fetching message from `{parsed.chat_ref}` / msg `{parsed.message_id}`...",
+        parse_mode="Markdown",
     )
     try:
-        fetched = await user_session.fetch_message(parsed)
+        fetched, diag = await user_session.fetch_message(parsed)
     except Exception as e:
         logger.exception("fetch_message failed")
-        await status.edit_text(f"Failed to fetch: {e}")
+        await status.edit_text(
+            f"❌ Failed to fetch: `{type(e).__name__}: {e}`\n\n"
+            f"This is unexpected — the fetch_message method should have caught this. "
+            f"Check the bot logs.",
+            parse_mode="Markdown",
+        )
         return
 
     if not fetched:
+        # Show the full step-by-step diagnostic log to the user so they can
+        # pinpoint exactly where the fetch failed. This is the key change —
+        # previously the user just got "Couldn't fetch that message" with
+        # no detail.
+        diag_text = "\n".join(diag)
+        # Telegram messages have a 4096-char limit. Truncate if needed.
+        if len(diag_text) > 3800:
+            diag_text = diag_text[:3800] + "\n... (truncated)"
         await status.edit_text(
-            "Couldn't fetch that message. Make sure your user account is a "
-            "member of the channel and the link points to a real post."
+            f"❌ Couldn't fetch that message.\n\n"
+            f"📋 Step-by-step diagnostic:\n```\n{diag_text}\n```",
+            parse_mode="Markdown",
         )
         return
 
@@ -91,30 +106,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text_only: str | None = None
 
     messages_to_handle = album if album else [msg]
+    download_errors: list[str] = []
     for idx, m in enumerate(messages_to_handle):
         # Capture caption from the first message
         if idx == 0:
             caption = m.message  # caption / text
 
-        media_path = await _download_media(user_session, m, tmp_dir, idx)
+        media_path, dl_err = await _download_media(user_session, m, tmp_dir, idx)
         if media_path:
             media_paths.append(media_path)
+        elif dl_err:
+            download_errors.append(f"  • item {idx}: {dl_err}")
         elif m.message and not media_paths:
-            # Bug fix: previously the condition was `elif not messages_to_handle
-            # and m.message:` — but `messages_to_handle` is always truthy
-            # (it's at least `[msg]`), so this branch was dead code and
-            # `text_only` was never set. As a result, text-only posts in
-            # locked channels were forwarded with `media_paths=[]` and
-            # `text=None`, which triggered "Empty link payload" in
-            # _forward_link.
-            #
-            # Fix: only set text_only if we haven't successfully downloaded
-            # any media yet. For albums, the first media item's caption
-            # wins.
             text_only = m.message
 
     if not media_paths and not text_only and not caption:
-        await status.edit_text("That message has no viewable content.")
+        msg_text = "That message has no viewable content."
+        if download_errors:
+            msg_text += "\n\nDownload errors:\n" + "\n".join(download_errors)
+        await status.edit_text(msg_text)
         return
 
     # Show diagnostic info so the user knows if media was actually downloaded
@@ -122,11 +132,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # text-only post — no media to forward
         pass
     elif not media_paths:
-        # We expected media but got none — downloads failed silently
+        err_text = "\n".join(download_errors[:5]) if download_errors else "(no specific errors)"
         await status.edit_text(
-            "Could not download media from that post. The bot's user account "
-            "may not have access to the file, or the file is too large "
-            "(>50MB Bot API limit). Falling back to text only."
+            f"⚠️ Could not download media from that post.\n\n"
+            f"Errors:\n{err_text}\n\n"
+            f"Common causes:\n"
+            f"  • File is too large (>50MB Bot API limit for re-upload)\n"
+            f"  • Telethon session expired — re-run `python login.py --string`\n"
+            f"  • Render free tier timeout (60s webhook limit)\n\n"
+            f"Falling back to text only."
         )
         # Continue and let _forward_link send the text fallback
 
@@ -197,19 +211,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await status.edit_text(label, reply_markup=keyboard)
 
 
-async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int) -> Optional[dict]:
-    """Download the media attached to a Telethon Message to disk. Returns a
-    dict {'path': str, 'type': str} or None if the message has no media."""
+async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int) -> tuple[Optional[dict], Optional[str]]:
+    """Download the media attached to a Telethon Message to disk.
+
+    Returns a tuple (result, error):
+      - result: dict {'path': str, 'type': str} on success, None on failure
+      - error: str | None — human-readable error message if download failed,
+                or None if there was simply no media (not an error)
+
+    The error string is what's new — previously the function returned None
+    for both "no media" and "download failed", which made it impossible to
+    surface the actual cause to the user. Now the caller can distinguish
+    and show the user exactly why the download failed.
+    """
     from telethon.tl import types as tl
 
     if not msg or not msg.media:
-        return None
+        return None, None  # no media — not an error
     # Skip web pages / contacts / geos (no downloadable file)
     if isinstance(msg.media, (tl.MessageMediaWebPage, tl.MessageMediaContact,
                                tl.MessageMediaGeo, tl.MessageMediaVenue,
                                tl.MessageMediaGame, tl.MessageMediaPoll,
                                tl.MessageMediaUnsupported)):
-        return None
+        return None, f"unsupported media type: {type(msg.media).__name__}"
 
     # Determine type
     media_type = "document"
@@ -238,7 +262,28 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
                 else:
                     media_type = "audio"
     elif isinstance(msg.media, tl.MessageMediaWebPage):
-        return None
+        return None, "media is a web page (no file to download)"
+
+    # Get file size BEFORE downloading if possible — avoids downloading
+    # a huge file only to reject it for being too large
+    try:
+        if isinstance(msg.media, tl.MessageMediaDocument) and msg.media.document:
+            file_size = msg.media.document.size or 0
+            if file_size > MAX_DOWNLOAD_BYTES:
+                mb = file_size / (1024 * 1024)
+                return None, f"file too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB limit)"
+        elif isinstance(msg.media, tl.MessageMediaPhoto) and msg.media.photo:
+            # Photo sizes are in msg.media.photo.sizes; the largest is the
+            # last one (or one with type='x')
+            sizes = msg.media.photo.sizes
+            if sizes:
+                largest = sizes[-1]
+                file_size = getattr(largest, "size", 0) or 0
+                if file_size > MAX_DOWNLOAD_BYTES:
+                    mb = file_size / (1024 * 1024)
+                    return None, f"photo too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB limit)"
+    except Exception:
+        pass  # best-effort size check; proceed with download
 
     # Download
     out_path = os.path.join(tmp_dir, f"media_{idx}_{int(time.time())}")
@@ -246,9 +291,9 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
         result = await user_session.client.download_media(msg, file=out_path)
     except Exception as e:
         logger.warning("download_media failed: %s", e)
-        return None
+        return None, f"download failed: {type(e).__name__}: {e}"
     if not result:
-        return None
+        return None, "download returned no result"
     if isinstance(result, bytes):
         out_path = out_path  # bytes path, save to disk
         with open(out_path, "wb") as f:
@@ -259,8 +304,8 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
     # Check size
     try:
         sz = os.path.getsize(out_path)
-    except OSError:
-        return None
+    except OSError as e:
+        return None, f"could not get file size: {e}"
     if sz > MAX_DOWNLOAD_BYTES:
         logger.warning("Skipping media (%d bytes) — exceeds %d limit",
                        sz, MAX_DOWNLOAD_BYTES)
@@ -268,9 +313,10 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
             os.remove(out_path)
         except OSError:
             pass
-        return None
+        mb = sz / (1024 * 1024)
+        return None, f"downloaded file too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB Bot API limit)"
 
-    return {"path": out_path, "type": media_type}
+    return {"path": out_path, "type": media_type}, None
 
 
 async def _cleanup_tmp_later(tmp_dir: str, delay_seconds: int) -> None:

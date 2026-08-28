@@ -184,66 +184,164 @@ class UserSession:
 
     # ---------- message fetching for locked channels ----------
 
-    async def fetch_message(self, parsed: ParsedLink) -> Optional[dict]:
+    async def fetch_message(self, parsed: ParsedLink) -> tuple[Optional[dict], list[str]]:
         """Fetch a single message (and possibly its album siblings) from a
         private / public channel the user account is a member of.
 
-        Returns a dict with keys:
-          chat_id: int (negative for channels)
-          message: telethon Message object (single)
-          album: list[Message] | None  (album siblings if any)
+        Returns a tuple of (result_or_none, diagnostics_log) where:
+          - result_or_none is a dict with keys:
+              chat_id: int (negative for channels)
+              message: telethon Message object (single)
+              album: list[Message] | None  (album siblings if any)
+            ...or None if fetch failed
+          - diagnostics_log is a list of human-readable strings describing
+            each step that was attempted (for surfacing to the user when
+            something fails)
+
+        The diagnostics_log is what made the difference — previously the bot
+        would say "Couldn't fetch that message" with no detail. Now the user
+        gets the full step-by-step trace so they can pinpoint the failure
+        (e.g. "Step 2 failed: ChannelPrivateError - you're not a member").
         """
+        diag: list[str] = []
+        diag.append(f"Step 1: Parsed link → kind={parsed.kind}, chat_ref={parsed.chat_ref}, msg_id={parsed.message_id}")
+
+        # Step 2: resolve entity
         try:
             if parsed.kind == "private":
                 chat_id = int(parsed.chat_ref)
-                entity = await self.client.get_input_entity(chat_id)
+                diag.append(f"Step 2: Resolving entity for chat_id={chat_id} via Telethon get_entity()...")
+                # Use get_entity instead of get_input_entity — it makes a
+                # network call to resolve unknown entities (e.g. channels the
+                # user just joined that aren't in Telethon's session cache).
+                # get_input_entity only uses the cache and can fail for new
+                # channels.
+                entity = await self.client.get_entity(chat_id)
             else:
-                entity = await self.client.get_input_entity(parsed.chat_ref)
-        except ChannelPrivateError:
-            logger.error("You are not a member of chat %s", parsed.chat_ref)
-            return None
-        except Exception:
-            logger.exception("Could not resolve entity for %s", parsed.chat_ref)
-            return None
+                diag.append(f"Step 2: Resolving entity for username={parsed.chat_ref} via Telethon get_entity()...")
+                entity = await self.client.get_entity(parsed.chat_ref)
+            diag.append(f"Step 2: ✓ Entity resolved → {type(entity).__name__} (id={getattr(entity, 'id', '?')})")
+        except ChannelPrivateError as e:
+            diag.append(f"Step 2: ✗ FAILED — ChannelPrivateError: {e}")
+            diag.append("  → Your user account is NOT a member of this chat, or the chat doesn't exist.")
+            return None, diag
+        except Exception as e:
+            diag.append(f"Step 2: ✗ FAILED — {type(e).__name__}: {e}")
+            return None, diag
 
+        # Step 3: fetch the message
         try:
-            messages = await self.client.get_messages(
-                entity, ids=parsed.message_id
-            )
-        except Exception:
-            logger.exception("get_messages failed")
-            return None
+            diag.append(f"Step 3: Fetching message id={parsed.message_id} via get_messages()...")
+            messages = await self.client.get_messages(entity, ids=parsed.message_id)
+        except Exception as e:
+            diag.append(f"Step 3: ✗ FAILED — {type(e).__name__}: {e}")
+            return None, diag
 
         if not messages:
-            return None
+            diag.append(f"Step 3: ✗ No message returned — message_id={parsed.message_id} may not exist in this chat.")
+            return None, diag
+
         msg = messages[0] if isinstance(messages, list) else messages
         if not msg:
-            return None
+            diag.append("Step 3: ✗ Message object is empty.")
+            return None, diag
 
-        # Detect album — group_id is set on messages that are part of an album
+        diag.append(f"Step 3: ✓ Message fetched (id={msg.id}, has_media={bool(getattr(msg, 'media', None))})")
+
+        # Step 4: detect album
         album: list = []
         if getattr(msg, "grouped_id", None):
             try:
-                # fetch all messages around this one to get album siblings
-                all_msgs = await self.client.get_messages(
-                    entity,
-                    limit=20,
-                    # We need to find siblings; iterate a small window
-                )
+                diag.append(f"Step 4: Message is part of an album (grouped_id={msg.grouped_id}). Fetching siblings...")
+                all_msgs = await self.client.get_messages(entity, limit=20)
                 album = [m for m in all_msgs
                          if getattr(m, "grouped_id", None) == msg.grouped_id]
                 album.sort(key=lambda m: m.id)
-            except Exception:
-                logger.exception("album fetch failed")
+                diag.append(f"Step 4: ✓ Found {len(album)} sibling(s) in the album")
+            except Exception as e:
+                diag.append(f"Step 4: ✗ Album fetch failed (continuing with single message) — {type(e).__name__}: {e}")
                 album = []
+        else:
+            diag.append("Step 4: Message is NOT part of an album (single message).")
 
+        # Step 5: compute chat_id in Bot API format
         chat_real_id = msg.peer_id.channel_id if isinstance(msg.peer_id, tl.PeerChannel) else msg.chat_id
-        # Bot API convention: -100 concatenated with the raw channel_id
+        bot_api_chat_id = -1_000_000_000_000 - chat_real_id
+        diag.append(f"Step 5: ✓ Chat resolved to Bot API chat_id={bot_api_chat_id}")
+
         return {
-            "chat_id": -1_000_000_000_000 - chat_real_id,
+            "chat_id": bot_api_chat_id,
             "message": msg,
             "album": album or None,
+        }, diag
+
+
+    async def test_link(self, parsed: ParsedLink) -> dict:
+        """Diagnostic method — try to resolve and fetch the link, return
+        a structured result with all the info. Used by /test_link command.
+
+        Returns a dict with keys:
+          parsed: dict — what was parsed from the URL
+          steps: list[str] — step-by-step diagnostic log
+          success: bool — whether fetch succeeded
+          error: str | None — top-level error message if any
+          has_media: bool — whether the message has downloadable media
+          media_type: str | None — 'photo' | 'video' | 'document' | etc.
+          chat_title: str | None — resolved chat title (if entity was resolved)
+        """
+        result = {
+            "parsed": {
+                "kind": parsed.kind,
+                "chat_ref": parsed.chat_ref,
+                "message_id": parsed.message_id,
+            },
+            "steps": [],
+            "success": False,
+            "error": None,
+            "has_media": False,
+            "media_type": None,
+            "chat_title": None,
         }
+
+        fetched, diag = await self.fetch_message(parsed)
+        result["steps"] = diag
+
+        if fetched is None:
+            result["error"] = "Fetch failed — see steps above for the cause."
+            return result
+
+        msg = fetched["message"]
+        result["success"] = True
+        result["has_media"] = bool(getattr(msg, "media", None))
+
+        # Determine media type
+        from telethon.tl import types as tl_types
+        if isinstance(msg.media, tl_types.MessageMediaPhoto):
+            result["media_type"] = "photo"
+        elif isinstance(msg.media, tl_types.MessageMediaDocument):
+            doc = msg.media.document
+            if doc and doc.mime_type:
+                if doc.mime_type.startswith("video/"):
+                    result["media_type"] = "video"
+                elif doc.mime_type.startswith("audio/"):
+                    result["media_type"] = "audio"
+                else:
+                    result["media_type"] = "document"
+            else:
+                result["media_type"] = "document"
+        elif isinstance(msg.media, tl_types.MessageMediaWebPage):
+            result["media_type"] = "web_page"
+        else:
+            result["media_type"] = type(msg.media).__name__ if msg.media else None
+
+        # Try to get chat title (best effort)
+        try:
+            entity = await self.client.get_entity(int(fetched["chat_id"]))
+            result["chat_title"] = getattr(entity, "title", None)
+        except Exception:
+            pass
+
+        return result
 
 
 __all__ = [

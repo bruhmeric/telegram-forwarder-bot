@@ -101,18 +101,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "*Commands*\n"
-        "/setgroup <id>  — set destination group (e.g. -1001234567890)\n"
-        "/refresh        — re-fetch forum topics via Telethon\n"
-        "/topics         — list currently-known topics\n"
-        "/addtopic <title> <id>  — add a topic manually\n"
+        "/setgroup <id>  — set destination group/channel (forum OR non-forum)\n"
+        "/info           — show destination chat info (is it a forum? title?)\n"
+        "/refresh        — re-fetch forum topics via Telethon (forum only)\n"
+        "/topics         — list currently-known topics (forum only)\n"
+        "/addtopic <title> <id>  — add a topic manually (forum only)\n"
         "/deltopic <id>  — remove a manually-added topic\n"
         "/status         — show bot status (Telethon, group, topics)\n"
         "/whoami         — show your Telegram user ID + admin status\n"
+        "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/cancel         — cancel the latest pending forward\n"
         "\n*Sending content*\n"
-        "• Send me a photo / video / text / file -> I show topics -> tap one\n"
-        "• Send me a t.me/c/<id>/<msg> link -> I fetch via your Telethon session\n"
-        "  and let you pick a topic",
+        "• Send me a photo / video / text / file -> I show topics (if forum) "
+        "or a single Forward button (if not) -> tap to forward\n"
+        "• Send me a t.me/c/<id>/<msg> link -> I fetch via your Telethon "
+        "session and let you pick a destination\n"
+        "\n*Destination types*\n"
+        "• Forum groups: pick a topic from the picker\n"
+        "• Regular groups/channels: single Forward button (no topic picker)",
         parse_mode="Markdown",
     )
 
@@ -161,8 +167,38 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot_data["db"].set_runtime("destination_group_id", str(gid))
     # Also stash on the config object so handlers don't need to re-read each time
     cfg.destination_group_id = gid
+
+    # Invalidate the cached "is_forum" check so it gets re-evaluated for the
+    # new destination on next use
+    context.bot_data.pop("destination_is_forum", None)
+    context.bot_data.pop("destination_is_forum_group_id", None)
+    context.bot_data.pop("destination_chat_title", None)
+
+    # Try to fetch chat info immediately so we can tell the user whether
+    # it's a forum or not (and update the cache at the same time)
+    chat_type_info = ""
+    try:
+        chat = await context.bot.get_chat(chat_id=gid)
+        is_forum = bool(getattr(chat, "is_forum", False))
+        title = getattr(chat, "title", None) or "(no title)"
+        # Cache it
+        context.bot_data["destination_is_forum"] = is_forum
+        context.bot_data["destination_is_forum_group_id"] = gid
+        context.bot_data["destination_chat_title"] = title
+        chat_type_info = (
+            f"\n\n📊 Chat info:\n"
+            f"  • Title: {title}\n"
+            f"  • Type: {getattr(chat, 'type', '?')}\n"
+            f"  • Is forum: {'✅ YES (use /refresh to discover topics)' if is_forum else '❌ NO (single Forward button)'}"
+        )
+    except Exception as e:
+        chat_type_info = (
+            f"\n\n⚠️ Couldn't fetch chat info: {type(e).__name__}: {e}\n"
+            f"Make sure the bot is a member of this chat."
+        )
+
     await update.effective_message.reply_text(
-        f"Destination group set to {gid}.\nRun /refresh to discover its topics."
+        f"✅ Destination group set to {gid}.{chat_type_info}"
     )
 
 
@@ -335,6 +371,164 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show destination chat info — is it a forum? what's the title?
+    Useful for debugging "is my destination a forum or not?"""
+    cfg = context.bot_data["config"]
+    db = context.bot_data["db"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/info DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+    group_id = cfg.destination_group_id
+    if group_id is None:
+        v = await db.get_runtime("destination_group_id")
+        group_id = int(v) if v else None
+    if group_id is None:
+        await update.effective_message.reply_text("No destination group set. /setgroup <id> first.")
+        return
+
+    status_msg = await update.effective_message.reply_text(f"Fetching info for chat `{group_id}`...", parse_mode="Markdown")
+
+    try:
+        chat = await context.bot.get_chat(chat_id=group_id)
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Failed to fetch chat info: `{type(e).__name__}: {e}`\n\n"
+            f"Make sure the bot is a member of the chat with permission to view chat info.",
+            parse_mode="Markdown",
+        )
+        return
+
+    is_forum = bool(getattr(chat, "is_forum", False))
+    title = getattr(chat, "title", None) or "(no title)"
+    chat_type = getattr(chat, "type", "?")
+    username = getattr(chat, "username", None)
+    member_count = "?"
+    try:
+        member_count = await context.bot.get_chat_member_count(chat_id=group_id)
+    except Exception:
+        pass
+
+    # If it's a forum, list known topics
+    topics_info = ""
+    if is_forum:
+        topics_mgr = context.bot_data.get("topics")
+        if topics_mgr:
+            topics = await topics_mgr.get_topics(group_id)
+            if topics:
+                topics_info = f"\n\n📋 Known topics ({len(topics)}):"
+                for t in topics[:20]:  # show up to 20
+                    topics_info += f"\n  • `{t['id']}` — {t['title']}"
+                if len(topics) > 20:
+                    topics_info += f"\n  ... and {len(topics) - 20} more"
+            else:
+                topics_info = "\n\n📋 No topics cached. Run /refresh to fetch them."
+        else:
+            topics_info = "\n\n📋 Topics manager not initialized."
+
+    # Update the cache
+    context.bot_data["destination_is_forum"] = is_forum
+    context.bot_data["destination_is_forum_group_id"] = group_id
+    context.bot_data["destination_chat_title"] = title
+
+    await status_msg.edit_text(
+        f"📊 Destination chat info:\n\n"
+        f"• ID: `{group_id}`\n"
+        f"• Title: {title}\n"
+        f"• Type: {chat_type}\n"
+        f"• Username: @{username}\n"
+        f"• Is forum (has topics): {'✅ YES' if is_forum else '❌ NO'}\n"
+        f"• Member count: {member_count}"
+        f"{topics_info}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_test_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Diagnostic command — try to fetch a t.me link via Telethon and show
+    the user a detailed report. Useful for debugging "forwarding from locked
+    private channels doesn't work".
+
+    Usage: /test_link https://t.me/c/1234567890/42
+    """
+    from user_session import parse_telegram_link
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/test_link DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+    user_session = context.bot_data.get("user_session")
+    if not user_session or not user_session.available:
+        await update.effective_message.reply_text(
+            "❌ Telethon user session not available.\n"
+            "Run `python login.py --string` locally and set SESSION_STRING env var."
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/test_link <t.me URL>`\n\n"
+            "Example: `/test_link https://t.me/c/1234567890/42`\n"
+            "         `/test_link https://t.me/somechannel/42`",
+            parse_mode="Markdown",
+        )
+        return
+
+    url = " ".join(context.args)
+    parsed = parse_telegram_link(url)
+    if not parsed:
+        await update.effective_message.reply_text(
+            f"❌ Could not parse URL: `{url}`\n\n"
+            f"Supported formats:\n"
+            f"  • `https://t.me/c/1234567890/42`  (private channel post)\n"
+            f"  • `https://t.me/channelname/42`   (public channel post)",
+            parse_mode="Markdown",
+        )
+        return
+
+    status_msg = await update.effective_message.reply_text(
+        f"🔍 Testing link...\n\n"
+        f"Parsed:\n"
+        f"  kind: `{parsed.kind}`\n"
+        f"  chat_ref: `{parsed.chat_ref}`\n"
+        f"  message_id: `{parsed.message_id}`\n\n"
+        f"Fetching via Telethon...",
+        parse_mode="Markdown",
+    )
+
+    try:
+        result = await user_session.test_link(parsed)
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Exception: `{type(e).__name__}: {e}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Build report
+    steps_text = "\n".join(result.get("steps", []))
+    if len(steps_text) > 3000:
+        steps_text = steps_text[:3000] + "\n... (truncated)"
+
+    report = (
+        f"📋 Test link report:\n\n"
+        f"Parsed:\n"
+        f"  kind: `{result['parsed']['kind']}`\n"
+        f"  chat_ref: `{result['parsed']['chat_ref']}`\n"
+        f"  message_id: `{result['parsed']['message_id']}`\n\n"
+        f"Result:\n"
+        f"  success: {'✅ YES' if result['success'] else '❌ NO'}\n"
+        f"  has_media: {'✅' if result['has_media'] else '❌'}\n"
+        f"  media_type: `{result['media_type']}`\n"
+        f"  chat_title: {result['chat_title'] or '(unknown)'}\n"
+        f"  error: {result['error'] or '(none)'}\n\n"
+        f"Steps:\n```\n{steps_text}\n```"
+    )
+
+    await status_msg.edit_text(report, parse_mode="Markdown")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.bot_data["config"]
     db = context.bot_data["db"]
@@ -367,4 +561,6 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("deltopic", cmd_deltopic))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("test_link", cmd_test_link))
     app.add_handler(CommandHandler("cancel", cmd_cancel))

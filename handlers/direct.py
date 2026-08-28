@@ -229,7 +229,53 @@ async def _handle_album_message(update, context, chat_id, user_id, media_group_i
 
 # ---------- picker UI ----------
 
+async def _check_destination_forum(context, group_id: int) -> bool | None:
+    """Check if the destination chat is a forum (has topics enabled).
+
+    Returns:
+      True: chat is a forum (use topic picker)
+      False: chat is a regular group/channel (use single Forward button)
+      None: couldn't determine (network error, bot not a member, etc.)
+
+    Uses bot.get_chat() which is the Bot API method. We cache the result
+    in context.bot_data['destination_is_forum'] so we don't call get_chat
+    on every message — only on first call or after /setgroup changes the
+    destination.
+    """
+    # Check cache
+    cache = context.bot_data.get("destination_is_forum")
+    cached_group_id = context.bot_data.get("destination_is_forum_group_id")
+    if cache is not None and cached_group_id == group_id:
+        return cache
+
+    # Cache miss — fetch
+    try:
+        chat = await context.bot.get_chat(chat_id=group_id)
+        is_forum = bool(getattr(chat, "is_forum", False))
+        context.bot_data["destination_is_forum"] = is_forum
+        context.bot_data["destination_is_forum_group_id"] = group_id
+        # Also cache the chat title for nicer UI
+        title = getattr(chat, "title", None) or f"Chat {group_id}"
+        context.bot_data["destination_chat_title"] = title
+        logger.info("Destination chat %s is_forum=%s title=%r",
+                    group_id, is_forum, title)
+        return is_forum
+    except Exception as e:
+        logger.warning("get_chat failed for %s: %s — assuming forum=True (legacy behavior)", group_id, e)
+        # If we can't determine, assume forum (legacy behavior) so the bot
+        # doesn't break for users who had forums set up before this change.
+        context.bot_data["destination_is_forum"] = True
+        context.bot_data["destination_is_forum_group_id"] = group_id
+        context.bot_data["destination_chat_title"] = f"Chat {group_id}"
+        return True
+
+
 async def _show_picker(update: Update, context, pending_id: str, label: str) -> None:
+    """Show the topic picker (forum) or a single Forward button (non-forum).
+
+    For non-forum destinations, the picker is just one button labeled
+    "Forward to <chat_title>" with callback data fwd:<pending_id>:0
+    (topic_id=0 means "no topic")."""
     topics_mgr = context.bot_data["topics"]
     cfg = context.bot_data["config"]
     db = context.bot_data["db"]
@@ -242,18 +288,37 @@ async def _show_picker(update: Update, context, pending_id: str, label: str) -> 
             )
             return
         group_id = int(group_id_raw)
-    topics = await topics_mgr.get_topics(group_id)
-    if not topics:
-        await update.effective_message.reply_text(
-            "No topics found. Try /refresh (requires Telethon user session) "
-            "or add manually with /addtopic <title> <topic_id>."
-        )
-        return
-    keyboard = topics_mgr.build_keyboard(pending_id, topics)
-    await update.effective_message.reply_text(label, reply_markup=keyboard)
+
+    # Check if destination is a forum
+    is_forum = await _check_destination_forum(context, group_id)
+    chat_title = context.bot_data.get("destination_chat_title") or f"Chat {group_id}"
+
+    if is_forum:
+        # Forum — show topic picker
+        topics = await topics_mgr.get_topics(group_id)
+        if not topics:
+            await update.effective_message.reply_text(
+                "No topics found. Try /refresh (requires Telethon user session) "
+                "or add manually with /addtopic <title> <topic_id>."
+            )
+            return
+        keyboard = topics_mgr.build_keyboard(pending_id, topics)
+        await update.effective_message.reply_text(label, reply_markup=keyboard)
+    else:
+        # Non-forum — show single "Forward" button
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=f"➡️ Forward to {chat_title}",
+                callback_data=f"fwd:{pending_id}:0",
+            )],
+            [InlineKeyboardButton(text="Cancel", callback_data=f"cancel:{pending_id}")],
+        ])
+        await update.effective_message.reply_text(label, reply_markup=keyboard)
 
 
 async def _send_picker_new(context, chat_id: int, pending_id: str, label: str) -> None:
+    """Same as _show_picker but sends a NEW message (used for albums)."""
     topics_mgr = context.bot_data["topics"]
     cfg = context.bot_data["config"]
     db = context.bot_data["db"]
@@ -265,13 +330,29 @@ async def _send_picker_new(context, chat_id: int, pending_id: str, label: str) -
         await context.bot.send_message(chat_id=chat_id,
                                        text="No destination group set. Use /setgroup <group_id>.")
         return
-    topics = await topics_mgr.get_topics(group_id)
-    if not topics:
-        await context.bot.send_message(chat_id=chat_id,
-                                       text="No topics found. /refresh or /addtopic first.")
-        return
-    keyboard = topics_mgr.build_keyboard(pending_id, topics)
-    await context.bot.send_message(chat_id=chat_id, text=label, reply_markup=keyboard)
+
+    # Check if destination is a forum
+    is_forum = await _check_destination_forum(context, group_id)
+    chat_title = context.bot_data.get("destination_chat_title") or f"Chat {group_id}"
+
+    if is_forum:
+        topics = await topics_mgr.get_topics(group_id)
+        if not topics:
+            await context.bot.send_message(chat_id=chat_id,
+                                           text="No topics found. /refresh or /addtopic first.")
+            return
+        keyboard = topics_mgr.build_keyboard(pending_id, topics)
+        await context.bot.send_message(chat_id=chat_id, text=label, reply_markup=keyboard)
+    else:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=f"➡️ Forward to {chat_title}",
+                callback_data=f"fwd:{pending_id}:0",
+            )],
+            [InlineKeyboardButton(text="Cancel", callback_data=f"cancel:{pending_id}")],
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=label, reply_markup=keyboard)
 
 
 # ---------- callback handler (topic button tapped) ----------
@@ -302,7 +383,10 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(data) < 3:
         return
     pending_id = data[1]
-    topic_id = int(data[2])
+    # topic_id: integer for forum topics, or 0 for non-forum destinations
+    # (0 means "no specific topic — send to the chat without a thread")
+    topic_id_raw = int(data[2])
+    topic_id = topic_id_raw if topic_id_raw > 0 else None
 
     db = context.bot_data["db"]
     cfg = context.bot_data["config"]
@@ -335,19 +419,20 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # was registered. For albums, include the count so they have a sense of
     # how long it'll take.
     is_album = (kind == "direct" and payload.get("kind") == "album")
+    target_label = f"topic {topic_id}" if topic_id else "chat"
     if is_album:
         n_media = len(payload.get("media_items") or [])
         n_text = len(payload.get("text_items") or [])
         if n_media:
             await q.edit_message_text(
-                f"Forwarding {n_media} media item(s) to topic {topic_id}..."
+                f"Forwarding {n_media} media item(s) to {target_label}..."
             )
         else:
             await q.edit_message_text(
-                f"Forwarding {n_text} text item(s) to topic {topic_id}..."
+                f"Forwarding {n_text} text item(s) to {target_label}..."
             )
     else:
-        await q.edit_message_text(f"Forwarding to topic {topic_id}...")
+        await q.edit_message_text(f"Forwarding to {target_label}...")
 
     try:
         if kind == "direct":
@@ -373,20 +458,36 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if n_text:
             parts.append(f"{n_text} text item(s)")
         summary = " + ".join(parts) if parts else "items"
-        await q.edit_message_text(f"Done — {summary} sent to topic {topic_id}.")
+        if topic_id:
+            await q.edit_message_text(f"Done — {summary} sent to topic {topic_id}.")
+        else:
+            await q.edit_message_text(f"Done — {summary} sent to chat.")
     else:
-        await q.edit_message_text(f"Done — sent to topic {topic_id}.")
+        if topic_id:
+            await q.edit_message_text(f"Done — sent to topic {topic_id}.")
+        else:
+            await q.edit_message_text(f"Done — sent to chat.")
 
 
 # ---------- actual forward primitives ----------
 
+def _thread_kwargs(topic_id: int | None) -> dict:
+    """Return kwargs for the Bot API call with message_thread_id only if
+    topic_id is set. For non-forum destinations, topic_id is None and we
+    don't pass message_thread_id at all (Telegram would reject it)."""
+    if topic_id:
+        return {"message_thread_id": topic_id}
+    return {}
+
+
 async def _forward_single(context, src_chat_id, src_msg_id, dest_group_id, topic_id) -> None:
-    """Copy a single message to the destination topic using bot.copy_message."""
+    """Copy a single message to the destination topic (or chat if non-forum)
+    using bot.copy_message."""
     await context.bot.copy_message(
         chat_id=dest_group_id,
         from_chat_id=src_chat_id,
         message_id=src_msg_id,
-        message_thread_id=topic_id,
+        **_thread_kwargs(topic_id),
     )
 
 
@@ -458,11 +559,11 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
                 await context.bot.send_media_group(
                     chat_id=dest_group_id,
                     media=input_media,
-                    message_thread_id=topic_id,
+                    **_thread_kwargs(topic_id),
                 )
                 sent_count += len(chunk)
-                logger.info("Album chunk sent: %d items to topic %d",
-                            len(chunk), topic_id)
+                logger.info("Album chunk sent: %d items to %s",
+                            len(chunk), f"topic {topic_id}" if topic_id else "chat")
             except Exception as e:
                 logger.warning("send_media_group failed for chunk %d-%d: %s",
                               chunk_start, chunk_start + len(chunk), e)
@@ -477,14 +578,14 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
                     chat_id=dest_group_id,
                     document=item["file_id"],
                     caption=cap,
-                    message_thread_id=topic_id,
+                    **_thread_kwargs(topic_id),
                 )
             elif item["type"] == "audio":
                 await context.bot.send_audio(
                     chat_id=dest_group_id,
                     audio=item["file_id"],
                     caption=cap,
-                    message_thread_id=topic_id,
+                    **_thread_kwargs(topic_id),
                 )
             sent_count += 1
         except Exception as e:
@@ -497,7 +598,7 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
             await context.bot.send_message(
                 chat_id=dest_group_id,
                 text=item["text"],
-                message_thread_id=topic_id,
+                **_thread_kwargs(topic_id),
             )
             sent_count += 1
         except Exception as e:
@@ -505,8 +606,9 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
             failed.append(([item], e))
 
     total = len(media_items) + len(text_items)
-    logger.info("Album forward: %d/%d items sent to topic %d",
-                sent_count, total, topic_id)
+    target = f"topic {topic_id}" if topic_id else "chat"
+    logger.info("Album forward: %d/%d items sent to %s",
+                sent_count, total, target)
 
     if failed and sent_count == 0:
         # All failed — re-raise the first error so the user sees it
@@ -545,41 +647,43 @@ async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
             await bot.send_media_group(
                 chat_id=dest_group_id,
                 media=input_media,
-                message_thread_id=topic_id,
+                **_thread_kwargs(topic_id),
             )
     elif text or caption:
         # Fallback: text-only post or media download failed
-        # Send the text/caption as a plain message to the destination topic
+        # Send the text/caption as a plain message to the destination topic (or chat)
         await bot.send_message(
-            chat_id=dest_group_id, text=text or caption, message_thread_id=topic_id,
+            chat_id=dest_group_id, text=text or caption,
+            **_thread_kwargs(topic_id),
         )
     else:
         raise RuntimeError("Empty link payload")
 
 
 async def _send_one(bot, dest_group_id, topic_id, media, caption):
+    """Send a single media item to the destination topic (or chat)."""
     path = media["path"]
     mtype = media["type"]
+    tk = _thread_kwargs(topic_id)
     if mtype == "photo":
         await bot.send_photo(chat_id=dest_group_id, photo=open(path, "rb"),
-                              caption=caption, message_thread_id=topic_id)
+                              caption=caption, **tk)
     elif mtype == "video":
         await bot.send_video(chat_id=dest_group_id, video=open(path, "rb"),
-                              caption=caption, message_thread_id=topic_id,
-                              supports_streaming=True)
+                              caption=caption, supports_streaming=True, **tk)
     elif mtype == "animation":
         await bot.send_animation(chat_id=dest_group_id, animation=open(path, "rb"),
-                                  caption=caption, message_thread_id=topic_id)
+                                  caption=caption, **tk)
     elif mtype == "audio":
         await bot.send_audio(chat_id=dest_group_id, audio=open(path, "rb"),
-                              caption=caption, message_thread_id=topic_id)
+                              caption=caption, **tk)
     elif mtype == "voice":
         await bot.send_voice(chat_id=dest_group_id, voice=open(path, "rb"),
-                              caption=caption, message_thread_id=topic_id)
+                              caption=caption, **tk)
     elif mtype == "document":
         await bot.send_document(chat_id=dest_group_id, document=open(path, "rb"),
-                                 caption=caption, message_thread_id=topic_id)
+                                 caption=caption, **tk)
     else:
         # fallback
         await bot.send_document(chat_id=dest_group_id, document=open(path, "rb"),
-                                 caption=caption, message_thread_id=topic_id)
+                                 caption=caption, **tk)
