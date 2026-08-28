@@ -869,6 +869,21 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except Exception:
             pass  # rate-limited or message unchanged
 
+    # Stats callback — updates context.bot_data["scrape_status"] with the
+    # latest counts from scrape_channel's result dict. This is what makes
+    # /scrape_status show CURRENT progress (not stale data from start time).
+    async def stats_callback(result_dict: dict):
+        context.bot_data["scrape_status"].update({
+            "sent_count": result_dict.get("sent_count", 0),
+            "failed_count": result_dict.get("failed_count", 0),
+            "skipped_count": result_dict.get("skipped_count", 0),
+            "total_seen": result_dict.get("total_seen", 0),
+            "last_message_id": result_dict.get("last_message_id", 0),
+            "flood_waits": result_dict.get("flood_waits", 0),
+            "cancelled": result_dict.get("cancelled", False),
+            "last_update": time.time(),
+        })
+
     # Run the scrape as a background task
     async def scrape_task():
         try:
@@ -881,6 +896,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reverse=oldest_first,
                 cancel_event=cancel_event,
                 status_callback=status_callback,
+                stats_callback=stats_callback,
                 media_types=media_types,
                 parallel=parallel,
                 custom_caption=custom_caption,
@@ -1037,6 +1053,7 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Sent: {status.get('sent_count', 0)}\n"
         f"Failed: {status.get('failed_count', 0)}\n"
         f"Skipped (filtered/no media): {status.get('skipped_count', 0)}\n"
+        f"Flood waits: {status.get('flood_waits', 0)}\n"
         f"Last msg ID: {status.get('last_message_id', 0)}",
         parse_mode="Markdown",
     )

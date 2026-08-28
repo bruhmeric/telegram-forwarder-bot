@@ -1180,6 +1180,7 @@ class UserSession:
         cancel_event=None,
         progress_callback=None,
         status_callback=None,
+        stats_callback=None,
         media_types: list[str] | None = None,
         parallel: int = 3,
         custom_caption: str | None = None,
@@ -1427,8 +1428,13 @@ class UserSession:
                 # Periodically drain completed tasks to avoid the list growing
                 # unboundedly for huge channels.
                 if len(pending_send_tasks) >= parallel * 4:
-                    # Wait for at least one to complete before continuing
-                    done, pending_send_tasks = await _asyncio.wait(
+                    # Wait for at least one to complete before continuing.
+                    # NOTE: asyncio.wait returns (done, pending) as SETS, not
+                    # lists. We must convert back to a list to keep using
+                    # .append() later. (Bug: was assigning the set directly,
+                    # causing "AttributeError: 'set' object has no attribute
+                    # 'append'" on the next iteration.)
+                    done, pending = await _asyncio.wait(
                         pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
                     )
                     # Drain all done tasks (their results were already applied
@@ -1438,6 +1444,8 @@ class UserSession:
                             t.result()  # raise exceptions if any
                         except Exception:
                             pass
+                    # Convert pending set back to list for .append() compatibility
+                    pending_send_tasks = list(pending)
 
                 # Progress callback
                 if progress_callback:
@@ -1465,6 +1473,14 @@ class UserSession:
                         f"Last msg ID: {result['last_message_id']}\n"
                         f"Parallel sends: {parallel}"
                     )
+
+                # Send stats to stats_callback (for bot_data updates so
+                # /scrape_status shows current progress, not stale data)
+                if stats_callback:
+                    try:
+                        await stats_callback(result)
+                    except Exception:
+                        pass
 
         except Exception as e:
             logger.exception("scrape_channel: iter_messages failed")
