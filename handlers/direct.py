@@ -490,7 +490,39 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _forward_single(context, src_chat_id, src_msg_id,
                                        group_id, topic_id)
         elif kind == "link":
-            await _forward_link(context, payload, group_id, topic_id)
+            # Build a progress callback that updates the inline keyboard
+            # message (the "Forwarding..." one the user tapped). We throttle
+            # updates to ~2/sec to avoid Telegram API rate limits.
+            last_update = {"time": 0.0, "text": ""}
+
+            async def progress_cb(sent_bytes: int, total_bytes: int, label: str):
+                import time as _time
+                now = _time.time()
+                # Throttle: only update at most every 0.5 sec, and only when
+                # the text actually changes (to avoid spamming Telegram).
+                if now - last_update["time"] < 0.5:
+                    return
+                if total_bytes > 0:
+                    pct = (sent_bytes / total_bytes) * 100
+                    sent_mb = sent_bytes / (1024 * 1024)
+                    total_mb = total_bytes / (1024 * 1024)
+                    text = (f"📡 {label}\n\n"
+                            f"Progress: {pct:.1f}%\n"
+                            f"{sent_mb:.2f} / {total_mb:.2f} MB")
+                else:
+                    text = f"📡 {label}..."
+                # Skip if the text is the same as the last update
+                if text == last_update["text"]:
+                    return
+                last_update["time"] = now
+                last_update["text"] = text
+                try:
+                    await q.edit_message_text(text)
+                except Exception:
+                    pass  # don't crash on edit failures (rate limit, etc.)
+
+            await _forward_link(context, payload, group_id, topic_id,
+                                progress_callback=progress_cb)
     except Exception as e:
         logger.exception("forward failed")
         await q.edit_message_text(f"Forward failed: {e}")
@@ -663,7 +695,8 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
         raise failed[0][1]
 
 
-async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
+async def _forward_link(context, payload, dest_group_id, topic_id,
+                        progress_callback=None) -> None:
     """Forward a previously-fetched locked-channel message to the destination
     topic (or chat). Handles two payload formats:
 
@@ -679,6 +712,11 @@ async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
 
     The legacy format is kept for backward compatibility with any pending
     forwards that were created before this update.
+
+    Args:
+      progress_callback: optional async callable(sent_bytes, total_bytes, label)
+        called during downloads and uploads. Used to show progress to the user
+        by editing the bot's "Forwarding..." message.
     """
     # ----- NEW: direct send via Telethon user session -----
     if payload.get("direct_send"):
@@ -693,6 +731,7 @@ async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
             source_message_ids=source_message_ids,
             dest_chat_id=dest_group_id,
             topic_id=topic_id,
+            progress_callback=progress_callback,
         )
         if not success:
             # Build a helpful error message — show the last few diagnostic lines
