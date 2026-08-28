@@ -492,16 +492,14 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif kind == "link":
             # Build a progress callback that updates the inline keyboard
             # message (the "Forwarding..." one the user tapped). We throttle
-            # updates to ~2/sec to avoid Telegram API rate limits.
-            last_update = {"time": 0.0, "text": ""}
+            # updates to ~2/sec to avoid Telegram API rate limits, but ALWAYS
+            # show the first update so the user sees immediate feedback.
+            import time as _time
+            last_update = {"time": 0.0, "text": "", "first": True}
 
             async def progress_cb(sent_bytes: int, total_bytes: int, label: str):
-                import time as _time
                 now = _time.time()
-                # Throttle: only update at most every 0.5 sec, and only when
-                # the text actually changes (to avoid spamming Telegram).
-                if now - last_update["time"] < 0.5:
-                    return
+                # Build the text first
                 if total_bytes > 0:
                     pct = (sent_bytes / total_bytes) * 100
                     sent_mb = sent_bytes / (1024 * 1024)
@@ -511,9 +509,18 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             f"{sent_mb:.2f} / {total_mb:.2f} MB")
                 else:
                     text = f"📡 {label}..."
-                # Skip if the text is the same as the last update
+
+                # Skip if the text is the same as the last update (no progress)
                 if text == last_update["text"]:
                     return
+
+                # Throttle: only update at most every 0.5 sec, EXCEPT for the
+                # very first update which we always send so the user sees
+                # immediate feedback when they tap the button.
+                if not last_update["first"]:
+                    if now - last_update["time"] < 0.5:
+                        return
+                last_update["first"] = False
                 last_update["time"] = now
                 last_update["text"] = text
                 try:

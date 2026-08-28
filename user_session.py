@@ -491,8 +491,9 @@ class UserSession:
         #   2. Upload as a brand new file via send_file(file=path) — no link
         #      to the protected source, Telegram can't tell it's a "forward"
         #   3. PRESERVE the original document attributes (DocumentAttributeVideo
-        #      with duration, dimensions, supports_streaming) and mime_type
-        #      so the file is sent as a PLAYABLE VIDEO (not a generic document).
+        #      with duration, dimensions) and mime_type so the file is sent
+        #      as a PLAYABLE VIDEO (not a generic document). Pass
+        #      supports_streaming=True to send_file for videos.
         diag.append("⚠ Falling back to download-to-disk + send_file (third path)")
         diag.append("  → This is slower but works for fully protected content")
 
@@ -525,37 +526,58 @@ class UserSession:
                         diag.append(f"✗ Failed to send text message {i+1}: {type(e).__name__}: {e}")
                     continue
 
-                # Photos use a different media type — handle separately
-                if isinstance(msg.media, tl_types.MessageMediaPhoto):
-                    out_path = os.path.join(tmp_dir, f"photo_{i}_{int(time.time())}.jpg")
-                    # Download with progress callback
-                    async def _photo_progress(sent, total):
+                # ----- Build the progress callback for this iteration -----
+                # IMPORTANT: Python closure bug — `i` and `phase` would all
+                # resolve to the last loop iteration's value if we just used
+                # them in a closure. We bind them as default args to make
+                # each callback capture its own values.
+                #
+                # Also: Telethon's progress_callback can be either sync OR
+                # async — Telethon awaits it via _maybe_await. So we can use
+                # async def. But we keep it sync and call the outer
+                # progress_callback (which is async) — _maybe_await will
+                # await the returned coroutine.
+                def make_progress_cb(item_index: int, total_items: int,
+                                      phase: str, filename: str):
+                    """Build a progress callback bound to the given iteration.
+                    `phase` is 'Downloading' or 'Uploading'."""
+                    def _cb(sent_bytes: int, total_bytes: int):
                         if progress_callback:
-                            try:
-                                progress_callback(sent, total, f"Downloading photo {i+1}/{len(messages)}")
-                            except Exception:
-                                pass
+                            label = f"{phase} {filename} ({item_index+1}/{total_items})"
+                            # progress_callback is async — _maybe_await will
+                            # await the returned coroutine
+                            return progress_callback(sent_bytes, total_bytes, label)
+                    return _cb
+
+                # ----- Photos: MessageMediaPhoto -----
+                if isinstance(msg.media, tl_types.MessageMediaPhoto):
+                    out_path = os.path.join(tmp_dir, f"photo_{i+1}_{int(time.time())}.jpg")
+                    dl_cb = make_progress_cb(i, len(messages), "Downloading", f"photo_{i+1}.jpg")
                     try:
-                        result = await self.client.download_media(msg, file=out_path, progress_callback=_photo_progress)
+                        result = await self.client.download_media(
+                            msg, file=out_path, progress_callback=dl_cb,
+                        )
                         if not result:
                             diag.append(f"✗ Could not download photo for message {i+1}")
                             continue
-                        out_path = str(result) if not isinstance(result, bytes) else out_path
                         if isinstance(result, bytes):
                             with open(out_path, "wb") as f:
                                 f.write(result)
+                        else:
+                            out_path = str(result)
                         sz = os.path.getsize(out_path)
-                        diag.append(f"  • Downloaded photo {i+1}/{len(messages)} ({sz/1024:.1f} KB)")
+                        diag.append(f"  • Downloaded photo_{i+1}.jpg ({sz/1024:.1f} KB)")
                     except Exception as e:
                         diag.append(f"✗ Failed to download photo {i+1}: {type(e).__name__}: {e}")
                         continue
-                    # Send as photo (Telethon auto-detects image files)
+                    # Send as photo — force_document=False lets Telethon treat
+                    # the .jpg file as a photo (InputMediaUploadedPhoto)
                     try:
                         send_kwargs = dict(
                             file=out_path,
                             caption=msg.message if i == 0 else "",
                             formatting_entities=msg.entities if i == 0 else None,
-                            force_document=False,  # let Telegram treat as photo
+                            force_document=False,
                         )
                         if topic_id:
                             from telethon.tl.types import MessageReplyHeader
@@ -563,15 +585,10 @@ class UserSession:
                                 reply_to_top_id=topic_id,
                                 reply_to_msg_id=topic_id,
                             )
-
-                        async def _upload_progress(sent, total):
-                            if progress_callback:
-                                try:
-                                    progress_callback(sent, total, f"Uploading photo {i+1}/{len(messages)}")
-                                except Exception:
-                                    pass
-
-                        await self.client.send_file(dest_entity, progress_callback=_upload_progress, **send_kwargs)
+                        ul_cb = make_progress_cb(i, len(messages), "Uploading", f"photo_{i+1}.jpg")
+                        await self.client.send_file(
+                            dest_entity, progress_callback=ul_cb, **send_kwargs,
+                        )
                         sent_count += 1
                         diag.append(f"✓ Sent re-uploaded photo {i+1}/{len(messages)}")
                     except Exception as e:
@@ -579,69 +596,69 @@ class UserSession:
                         last_error = e
                     continue
 
-                # Document-based media (video, audio, animation, document, voice)
-                # Extract the original attributes so we can pass them through
-                # to send_file. This is THE fix for "video sent as document"
-                # — without these attributes, Telegram doesn't know it's a
-                # video and shows it as a downloadable file with no duration.
+                # ----- Documents (video, audio, animation, generic document) -----
                 if isinstance(msg.media, tl_types.MessageMediaDocument):
                     doc = msg.media.document
                     if not doc:
                         diag.append(f"✗ No document in message {i+1}")
                         continue
 
-                    # Get the original mime_type and attributes
+                    # Extract original mime_type
                     original_mime = doc.mime_type or "application/octet-stream"
-                    # Copy the attributes — these include:
-                    #   - DocumentAttributeVideo (duration, w, h, supports_streaming)
-                    #   - DocumentAttributeAudio (duration, voice)
-                    #   - DocumentAttributeImageSize (w, h)
-                    #   - DocumentAttributeFilename (original filename)
-                    #   - DocumentAttributeAnimated (for GIFs)
-                    # We MUST pass these so the file is sent as a video with
-                    # duration, dimensions, and streaming support.
-                    original_attributes = list(doc.attributes) if doc.attributes else []
 
-                    # Determine if this is a video, audio, animation, or generic document
+                    # Determine media type from mime + attributes
                     is_video = original_mime.startswith("video/")
                     is_audio = original_mime.startswith("audio/")
-                    is_animation = any(isinstance(a, tl_types.DocumentAttributeAnimated) for a in original_attributes)
+                    is_animation = any(isinstance(a, tl_types.DocumentAttributeAnimated)
+                                       for a in (doc.attributes or []))
+                    is_image_doc = original_mime.startswith("image/")
 
-                    # Decide whether to force_document (e.g. for PDF, ZIP, etc.)
-                    force_document = False
-                    if not (is_video or is_audio or is_animation or original_mime.startswith("image/")):
-                        # Generic document (pdf, zip, etc.) — force as document
-                        force_document = True
-
-                    # Download to disk with progress callback
-                    # Build a clean filename based on the original
+                    # Find original filename
                     original_filename = None
-                    for attr in original_attributes:
+                    for attr in (doc.attributes or []):
                         if isinstance(attr, tl_types.DocumentAttributeFilename):
                             original_filename = attr.file_name
                             break
                     if not original_filename:
-                        # Generate one based on mime type
-                        ext_map = {"video/mp4": "mp4", "video/quicktime": "mov",
-                                    "audio/mpeg": "mp3", "audio/ogg": "ogg",
-                                    "image/jpeg": "jpg", "image/png": "png"}
+                        # Generate based on mime type
+                        ext_map = {
+                            "video/mp4": "mp4", "video/quicktime": "mov",
+                            "video/x-matroska": "mkv",
+                            "audio/mpeg": "mp3", "audio/ogg": "ogg",
+                            "audio/x-wav": "wav",
+                            "image/jpeg": "jpg", "image/png": "png",
+                        }
                         ext = ext_map.get(original_mime, "bin")
                         original_filename = f"media_{i+1}.{ext}"
 
+                    # Build the attributes list to pass to send_file.
+                    #
+                    # KEY INSIGHT: We must NOT pass DocumentAttributeFilename
+                    # because Telethon's get_attributes() regenerates it from
+                    # the local file path. If we pass both, Telethon may
+                    # override the regenerated one with our (potentially
+                    # inconsistent) one — and that's actually fine.
+                    # But we MUST keep DocumentAttributeVideo (with duration,
+                    # w, h, supports_streaming) and DocumentAttributeAudio
+                    # so Telegram knows it's a video/audio.
+                    #
+                    # We filter out DocumentAttributeFilename to avoid the
+                    # conflict; Telethon will use the local file's basename.
+                    original_attributes = [
+                        attr for attr in (doc.attributes or [])
+                        if not isinstance(attr, tl_types.DocumentAttributeFilename)
+                    ]
+
+                    # Decide force_document — True for generic files (pdf, zip)
+                    force_document = not (is_video or is_audio or
+                                          is_animation or is_image_doc)
+
+                    # Download to disk
                     out_path = os.path.join(tmp_dir, original_filename)
-
-                    async def _dl_progress(sent, total):
-                        if progress_callback:
-                            try:
-                                label = (f"Downloading {original_filename}"
-                                         f" ({i+1}/{len(messages)})")
-                                progress_callback(sent, total, label)
-                            except Exception:
-                                pass
-
+                    dl_cb = make_progress_cb(i, len(messages), "Downloading", original_filename)
                     try:
                         result = await self.client.download_media(
-                            msg, file=out_path, progress_callback=_dl_progress,
+                            msg, file=out_path, progress_callback=dl_cb,
                         )
                         if not result:
                             diag.append(f"✗ Could not download media for message {i+1}")
@@ -652,53 +669,54 @@ class UserSession:
                         else:
                             out_path = str(result)
                         sz = os.path.getsize(out_path)
-                        diag.append(f"  • Downloaded {original_filename} ({sz/1024/1024:.1f} MB)")
+                        diag.append(f"  • Downloaded {original_filename} "
+                                    f"({sz/1024/1024:.1f} MB, mime={original_mime})")
                     except Exception as e:
-                        diag.append(f"✗ Failed to download media {i+1}: {type(e).__name__}: {e}")
+                        diag.append(f"✗ Failed to download media {i+1}: "
+                                    f"{type(e).__name__}: {e}")
                         continue
 
-                    # Send the file with the ORIGINAL attributes preserved.
-                    # This is the key fix — passing `attributes=original_attributes`
-                    # ensures Telegram knows it's a video with duration, dimensions,
-                    # and supports_streaming=True.
+                    # Send the file with preserved attributes + supports_streaming
                     try:
                         send_kwargs = dict(
                             file=out_path,
                             caption=msg.message if i == 0 else "",
                             formatting_entities=msg.entities if i == 0 else None,
-                            # Pass the original document attributes — this is what
-                            # makes it a playable video instead of a generic file.
+                            # Pass the original attributes (minus Filename)
+                            # so Telegram sees the video duration/dims.
                             attributes=original_attributes,
                             mime_type=original_mime,
                             force_document=force_document,
                         )
+                        # KEY FIX: Pass supports_streaming=True for videos
+                        # so Telegram shows it as a streamable video.
+                        if is_video:
+                            send_kwargs["supports_streaming"] = True
+                        # voice_note for voice messages
+                        if is_audio:
+                            for attr in (doc.attributes or []):
+                                if isinstance(attr, tl_types.DocumentAttributeAudio) and getattr(attr, "voice", False):
+                                    send_kwargs["voice_note"] = True
+                                    break
+
                         if topic_id:
                             from telethon.tl.types import MessageReplyHeader
                             send_kwargs["reply_to"] = MessageReplyHeader(
                                 reply_to_top_id=topic_id,
                                 reply_to_msg_id=topic_id,
                             )
-
-                        async def _ul_progress(sent, total):
-                            if progress_callback:
-                                try:
-                                    label = (f"Uploading {original_filename} "
-                                             f"({i+1}/{len(messages)})")
-                                    progress_callback(sent, total, label)
-                                except Exception:
-                                    pass
-
+                        ul_cb = make_progress_cb(i, len(messages), "Uploading", original_filename)
                         await self.client.send_file(
-                            dest_entity,
-                            progress_callback=_ul_progress,
-                            **send_kwargs,
+                            dest_entity, progress_callback=ul_cb, **send_kwargs,
                         )
                         sent_count += 1
                         if is_video:
                             diag.append(f"✓ Sent re-uploaded video {i+1}/{len(messages)} "
-                                        f"(as playable video with duration/dims)")
+                                        f"(playable, streaming, with duration/dims)")
                         elif is_audio:
                             diag.append(f"✓ Sent re-uploaded audio {i+1}/{len(messages)}")
+                        elif is_animation:
+                            diag.append(f"✓ Sent re-uploaded animation {i+1}/{len(messages)}")
                         else:
                             diag.append(f"✓ Sent re-uploaded document {i+1}/{len(messages)}")
                     except Exception as e:
