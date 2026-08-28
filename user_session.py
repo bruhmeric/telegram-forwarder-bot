@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -342,6 +343,247 @@ class UserSession:
             pass
 
         return result
+
+    # ---------- direct send to destination (NEW — fast path) ----------
+
+    async def send_to_destination(
+        self,
+        source_chat_id: int,
+        source_message_ids: list[int],
+        dest_chat_id: int,
+        topic_id: int | None = None,
+    ) -> tuple[bool, list[str]]:
+        """Send message(s) from a source chat to the destination chat using
+        the user account (Telethon). This is the NEW fast path that avoids
+        downloading media to disk and re-uploading via Bot API.
+
+        Strategy (per the user's research on hybrid bot patterns):
+          1. Try `user_client.forward_messages(dest, source_msg_ids, source_chat)`
+             — this is the TRUE Telegram forward, fastest, preserves original
+             sender info, and works for albums natively.
+          2. If forward_messages fails (because the source has noforwards
+             restriction), fall back to `user_client.send_message(dest,
+             file=msg.media, formatting_entities=msg.entities)` for each
+             message — this re-uploads from Telegram's servers WITHOUT
+             downloading to disk. For protected albums, items are sent
+             individually (loses album grouping in destination, but works).
+
+        Requirements:
+          - The user account must be a member of BOTH source and destination
+          - For topics, pass topic_id (the topic's top message ID)
+
+        Returns:
+          (success: bool, diagnostics_log: list[str])
+        """
+        diag: list[str] = []
+        diag.append(f"send_to_destination: {len(source_message_ids)} message(s) "
+                    f"from {source_chat_id} to {dest_chat_id}"
+                    f"{f' topic {topic_id}' if topic_id else ''}")
+
+        try:
+            source_entity = await self.client.get_entity(source_chat_id)
+            dest_entity = await self.client.get_entity(dest_chat_id)
+            diag.append(f"✓ Resolved source ({type(source_entity).__name__}) and "
+                        f"destination ({type(dest_entity).__name__})")
+        except Exception as e:
+            diag.append(f"✗ Failed to resolve entities: {type(e).__name__}: {e}")
+            return False, diag
+
+        # Fetch the messages first so we have them ready (also confirms access)
+        try:
+            messages = await self.client.get_messages(source_entity, ids=source_message_ids)
+            # Telethon returns None for missing messages; filter those out
+            if isinstance(messages, list):
+                messages = [m for m in messages if m is not None]
+            else:
+                messages = [messages] if messages else []
+            if not messages:
+                diag.append(f"✗ No messages found with IDs {source_message_ids}")
+                return False, diag
+            diag.append(f"✓ Fetched {len(messages)} message(s) from source")
+        except Exception as e:
+            diag.append(f"✗ Failed to fetch messages: {type(e).__name__}: {e}")
+            return False, diag
+
+        # ---- Step 1: try true forward (works for non-protected content) ----
+        try:
+            # Build reply_to for topics if specified
+            kwargs: dict = {}
+            if topic_id:
+                from telethon.tl.types import MessageReplyHeader
+                kwargs["reply_to"] = MessageReplyHeader(
+                    reply_to_top_id=topic_id,
+                    reply_to_msg_id=topic_id,
+                )
+
+            await self.client.forward_messages(
+                dest_entity,
+                [m.id for m in messages],
+                source_entity,
+            )
+            diag.append(f"✓ True forward succeeded — {len(messages)} message(s) "
+                        f"forwarded to destination"
+                        f"{f' (topic {topic_id})' if topic_id else ''}")
+            return True, diag
+        except Exception as forward_err:
+            diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
+            diag.append("  → Falling back to copy-and-resend (for protected content)")
+
+        # ---- Step 2: fallback — re-upload via send_message(file=msg.media) ----
+        # This bypasses the noforwards restriction by re-uploading from
+        # Telegram's servers directly (no disk download).
+        sent_count = 0
+        last_error = None
+        for i, msg in enumerate(messages):
+            try:
+                send_kwargs = dict(
+                    message=msg.message or "",
+                    file=msg.media,
+                    formatting_entities=msg.entities,
+                    link_preview=False,
+                )
+                if topic_id:
+                    from telethon.tl.types import MessageReplyHeader
+                    send_kwargs["reply_to"] = MessageReplyHeader(
+                        reply_to_top_id=topic_id,
+                        reply_to_msg_id=topic_id,
+                    )
+                # Only send the caption on the first message of an album
+                if i > 0:
+                    send_kwargs["message"] = ""
+
+                await self.client.send_message(dest_entity, **send_kwargs)
+                sent_count += 1
+                diag.append(f"✓ Re-sent message {i+1}/{len(messages)} "
+                            f"(type: {type(msg.media).__name__ if msg.media else 'text'})")
+            except Exception as e:
+                last_error = e
+                diag.append(f"✗ Failed to send message {i+1}/{len(messages)}: "
+                            f"{type(e).__name__}: {e}")
+
+        if sent_count == len(messages):
+            diag.append(f"✓ All {sent_count} message(s) re-sent to destination")
+            return True, diag
+        elif sent_count > 0:
+            diag.append(f"⚠ Partial success: {sent_count}/{len(messages)} sent")
+            return True, diag
+        else:
+            diag.append(f"✗ All sends failed. Last error: {last_error}")
+            return False, diag
+
+
+    # ---------- legacy: download media to disk (fallback path) ----------
+
+    async def download_message_media(
+        self,
+        source_chat_id: int,
+        source_message_ids: list[int],
+        tmp_dir: str,
+        max_bytes: int = 50 * 1024 * 1024,
+    ) -> tuple[list[dict], str | None, str | None, list[str]]:
+        """Legacy fallback: download media from source chat to disk for
+        re-upload via Bot API. Used when send_to_destination fails (e.g.,
+        user account is not a member of the destination).
+
+        Returns:
+          (media_paths, caption, text_only, diagnostics_log)
+
+        media_paths is a list of {'path': str, 'type': str}
+        caption is the original caption
+        text_only is set if no media was downloaded (text-only message)
+        """
+        diag: list[str] = []
+        media_paths: list[dict] = []
+        caption: str | None = None
+        text_only: str | None = None
+
+        try:
+            source_entity = await self.client.get_entity(source_chat_id)
+        except Exception as e:
+            diag.append(f"✗ Failed to resolve source entity: {type(e).__name__}: {e}")
+            return [], None, None, diag
+
+        messages = await self.client.get_messages(source_entity, ids=source_message_ids)
+        if isinstance(messages, list):
+            messages = [m for m in messages if m is not None]
+        else:
+            messages = [messages] if messages else []
+
+        if not messages:
+            diag.append(f"✗ No messages found with IDs {source_message_ids}")
+            return [], None, None, diag
+
+        from telethon.tl import types as tl
+
+        for idx, msg in enumerate(messages):
+            if idx == 0:
+                caption = msg.message
+
+            if not msg.media:
+                if msg.message and not media_paths:
+                    text_only = msg.message
+                continue
+
+            # Skip non-downloadable media types
+            if isinstance(msg.media, (tl.MessageMediaWebPage, tl.MessageMediaContact,
+                                       tl.MessageMediaGeo, tl.MessageMediaVenue,
+                                       tl.MessageMediaGame, tl.MessageMediaPoll,
+                                       tl.MessageMediaUnsupported)):
+                continue
+
+            # Determine type
+            media_type = "document"
+            if isinstance(msg.media, tl.MessageMediaPhoto):
+                media_type = "photo"
+            elif isinstance(msg.media, tl.MessageMediaDocument):
+                doc = msg.media.document
+                if doc and doc.mime_type:
+                    mt = doc.mime_type
+                    if mt.startswith("video/"):
+                        for attr in doc.attributes:
+                            if isinstance(attr, tl.DocumentAttributeAnimated):
+                                media_type = "animation"
+                                break
+                            if isinstance(attr, tl.DocumentAttributeVideo):
+                                media_type = "video_note" if getattr(attr, "round", False) else "video"
+                                break
+                    elif mt.startswith("audio/"):
+                        media_type = "voice" if "ogg" in mt else "audio"
+
+            # Check size before download
+            try:
+                if isinstance(msg.media, tl.MessageMediaDocument) and msg.media.document:
+                    sz = msg.media.document.size or 0
+                    if sz > max_bytes:
+                        diag.append(f"⚠ Skipping item {idx}: file too large "
+                                    f"({sz/1024/1024:.1f} MB > {max_bytes/1024/1024:.0f} MB)")
+                        continue
+            except Exception:
+                pass
+
+            # Download
+            out_path = os.path.join(tmp_dir, f"media_{idx}_{int(time.time())}")
+            try:
+                result = await self.client.download_media(msg, file=out_path)
+                if not result:
+                    continue
+                if isinstance(result, bytes):
+                    with open(out_path, "wb") as f:
+                        f.write(result)
+                else:
+                    out_path = str(result)
+                sz = os.path.getsize(out_path)
+                if sz > max_bytes:
+                    diag.append(f"⚠ Skipping item {idx}: downloaded {sz/1024/1024:.1f} MB "
+                                f"(> {max_bytes/1024/1024:.0f} MB Bot API limit)")
+                    os.remove(out_path)
+                    continue
+                media_paths.append({"path": out_path, "type": media_type})
+                diag.append(f"✓ Downloaded item {idx} ({media_type}, {sz/1024:.1f} KB)")
+            except Exception as e:
+                diag.append(f"✗ Failed to download item {idx}: {type(e).__name__}: {e}")
+
+        return media_paths, caption, text_only, diag
 
 
 __all__ = [

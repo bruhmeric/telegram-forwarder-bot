@@ -419,6 +419,7 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # was registered. For albums, include the count so they have a sense of
     # how long it'll take.
     is_album = (kind == "direct" and payload.get("kind") == "album")
+    is_link_direct = (kind == "link" and payload.get("direct_send") is True)
     target_label = f"topic {topic_id}" if topic_id else "chat"
     if is_album:
         n_media = len(payload.get("media_items") or [])
@@ -430,6 +431,17 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await q.edit_message_text(
                 f"Forwarding {n_text} text item(s) to {target_label}..."
+            )
+    elif is_link_direct:
+        n_msgs = len(payload.get("source_message_ids") or [])
+        if n_msgs > 1:
+            await q.edit_message_text(
+                f"📡 Forwarding {n_msgs} message(s) to {target_label} via Telethon..."
+            )
+        else:
+            media_type = (payload.get("media_types") or ["message"])[0]
+            await q.edit_message_text(
+                f"📡 Forwarding 1 {media_type} to {target_label} via Telethon..."
             )
     else:
         await q.edit_message_text(f"Forwarding to {target_label}...")
@@ -617,10 +629,52 @@ async def _forward_album(context, payload, dest_group_id, topic_id) -> None:
 
 async def _forward_link(context, payload, dest_group_id, topic_id) -> None:
     """Forward a previously-fetched locked-channel message to the destination
-    topic. Used by handlers/link.py via the pending mechanism."""
-    # The actual fetching happens in handlers/link.py before creating the
-    # pending record. The payload contains pre-downloaded media file paths
-    # and the original caption.
+    topic (or chat). Handles two payload formats:
+
+    1. NEW direct_send format (preferred, fast):
+       payload has direct_send=True, source_chat_id, source_message_ids.
+       Uses Telethon's user account to send directly from source to destination
+       via forward_messages (or send_message with file=... for protected content).
+       No disk download needed — re-uploads from Telegram's servers.
+
+    2. OLD format (legacy fallback):
+       payload has media_paths (list of downloaded file paths), caption, text.
+       Uses Bot API to re-upload from disk.
+
+    The legacy format is kept for backward compatibility with any pending
+    forwards that were created before this update.
+    """
+    # ----- NEW: direct send via Telethon user session -----
+    if payload.get("direct_send"):
+        user_session = context.bot_data.get("user_session")
+        if not user_session or not user_session.available:
+            raise RuntimeError("Direct send requires the Telethon user session, "
+                              "but it's not available. Run /status and check.")
+        source_chat_id = payload["source_chat_id"]
+        source_message_ids = payload["source_message_ids"]
+        success, diag = await user_session.send_to_destination(
+            source_chat_id=source_chat_id,
+            source_message_ids=source_message_ids,
+            dest_chat_id=dest_group_id,
+            topic_id=topic_id,
+        )
+        if not success:
+            # Build a helpful error message
+            err_lines = "\n".join(diag[-5:])  # last 5 lines (most relevant)
+            raise RuntimeError(
+                f"Direct send via Telethon failed.\n\n"
+                f"Last diagnostic steps:\n{err_lines}\n\n"
+                f"Likely causes:\n"
+                f"  • Your user account is NOT a member of the destination chat\n"
+                f"  • Your user account was kicked from the source chat\n"
+                f"  • Telethon session expired — re-run python login.py --string"
+            )
+        # Log full diagnostic
+        for line in diag:
+            logger.info("  " + line)
+        return
+
+    # ----- LEGACY: download + re-upload via Bot API -----
     from telethon.tl import types as tl
 
     bot = context.bot

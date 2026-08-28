@@ -99,82 +99,77 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = fetched["message"]
     album = fetched.get("album") or []
 
-    # Download media (if any) to temp files
-    tmp_dir = tempfile.mkdtemp(prefix="forwarder_")
-    media_paths: list[dict] = []
-    caption: str | None = ""
-    text_only: str | None = None
+    # NEW HYBRID APPROACH (per user's research on GetRestrictedMessages etc.):
+    # Instead of downloading media to disk now and re-uploading via Bot API
+    # when the user taps a topic, we just store the source chat_id and
+    # message IDs. When the user taps a topic, we use Telethon's
+    # `send_to_destination` which:
+    #   1. Tries `forward_messages` (true Telegram forward — fastest)
+    #   2. Falls back to `send_message(file=msg.media)` which re-uploads
+    #      from Telegram's servers WITHOUT downloading to disk first.
+    #
+    # This is dramatically faster (no download step) and works for protected
+    # content (the noforwards restriction is at Telegram's forward level, not
+    # at MTProto).
+    #
+    # The trade-off: the message appears as sent by the user account (since
+    # it's the user account sending), not by the bot. For most users this is
+    # fine — they're sending to their own group with their own account.
 
-    messages_to_handle = album if album else [msg]
-    download_errors: list[str] = []
-    for idx, m in enumerate(messages_to_handle):
-        # Capture caption from the first message
-        if idx == 0:
-            caption = m.message  # caption / text
+    source_chat_id = fetched["chat_id"]
+    source_message_ids = [m.id for m in (album if album else [msg])]
 
-        media_path, dl_err = await _download_media(user_session, m, tmp_dir, idx)
-        if media_path:
-            media_paths.append(media_path)
-        elif dl_err:
-            download_errors.append(f"  • item {idx}: {dl_err}")
-        elif m.message and not media_paths:
-            text_only = m.message
+    # Determine media type for display (without downloading)
+    from telethon.tl import types as tl
+    has_media = bool(getattr(msg, "media", None))
+    media_types: list[str] = []
+    if album:
+        for m in album:
+            if isinstance(getattr(m, "media", None), tl.MessageMediaPhoto):
+                media_types.append("photo")
+            elif isinstance(getattr(m, "media", None), tl.MessageMediaDocument):
+                doc = m.media.document
+                if doc and doc.mime_type and doc.mime_type.startswith("video/"):
+                    media_types.append("video")
+                else:
+                    media_types.append("document")
+            else:
+                media_types.append("text")
+    else:
+        if isinstance(getattr(msg, "media", None), tl.MessageMediaPhoto):
+            media_types.append("photo")
+        elif isinstance(getattr(msg, "media", None), tl.MessageMediaDocument):
+            doc = msg.media.document
+            if doc and doc.mime_type and doc.mime_type.startswith("video/"):
+                media_types.append("video")
+            else:
+                media_types.append("document")
+        elif msg.message:
+            media_types.append("text")
+        else:
+            media_types.append("unknown")
 
-    if not media_paths and not text_only and not caption:
-        msg_text = "That message has no viewable content."
-        if download_errors:
-            msg_text += "\n\nDownload errors:\n" + "\n".join(download_errors)
-        await status.edit_text(msg_text)
-        return
-
-    # Show diagnostic info so the user knows if media was actually downloaded
-    if not media_paths and (text_only or caption):
-        # text-only post — no media to forward
-        pass
-    elif not media_paths:
-        err_text = "\n".join(download_errors[:5]) if download_errors else "(no specific errors)"
-        await status.edit_text(
-            f"⚠️ Could not download media from that post.\n\n"
-            f"Errors:\n{err_text}\n\n"
-            f"Common causes:\n"
-            f"  • File is too large (>50MB Bot API limit for re-upload)\n"
-            f"  • Telethon session expired — re-run `python login.py --string`\n"
-            f"  • Render free tier timeout (60s webhook limit)\n\n"
-            f"Falling back to text only."
-        )
-        # Continue and let _forward_link send the text fallback
+    caption_preview = (msg.message or "")[:50]
 
     payload = {
-        "media_paths": media_paths,
-        "caption": caption,
-        "text": text_only,
-        "source_chat_id": fetched["chat_id"],
-        "source_message_id": parsed.message_id,
+        "direct_send": True,  # NEW — signals to use the fast path
+        "source_chat_id": source_chat_id,
+        "source_message_ids": source_message_ids,
+        "has_media": has_media,
+        "media_types": media_types,
+        "caption_preview": caption_preview,
     }
 
     db: Database = context.bot_data["db"]
     pending_id = await db.create_pending(
         user_id=user_id,
-        source_chat_id=fetched["chat_id"],
+        source_chat_id=source_chat_id,
         source_message_id=parsed.message_id,
         payload=payload,
         kind="link",
     )
 
-    # Schedule cleanup of temp files after 30 minutes.
-    #
-    # Previously used: context.application.job_queue.run_once(...)
-    # But job_queue is None in our custom webhook mode (PTB only initializes
-    # JobQueue when you call run_polling / run_webhook, AND only if the
-    # 'job-queue' extra is installed). This caused:
-    #   Internal error: 'NoneType' object has no attribute 'run_once'
-    # whenever a user sent a t.me link to a locked channel.
-    #
-    # Fix: just use asyncio.create_task + asyncio.sleep. Simpler, no
-    # extra dependencies, and works in both webhook and polling modes.
-    asyncio.create_task(_cleanup_tmp_later(tmp_dir, 30 * 60))
-
-    # Show topic picker
+    # Show topic picker (or single Forward button for non-forum)
     topics_mgr = context.bot_data["topics"]
     group_id = cfg.destination_group_id
     if group_id is None:
@@ -183,32 +178,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if group_id is None:
         await status.edit_text("No destination group set. Use /setgroup <group_id>.")
         return
-    topics = await topics_mgr.get_topics(group_id)
-    if not topics:
-        await status.edit_text("No topics found. /refresh or /addtopic first.")
-        return
-    keyboard = topics_mgr.build_keyboard(pending_id, topics)
-    n = len(media_paths)
+
+    # Build the label showing what was fetched
+    n = len(source_message_ids)
     if n == 1:
-        m = media_paths[0]
-        # Show media type so the user knows what's about to be sent
-        label = f"Fetched 1 {m['type']} — pick a topic:"
+        label = f"Fetched 1 {media_types[0]}"
+        if caption_preview:
+            label += f" (\"{caption_preview}...\")"
+        label += " — pick a destination:"
     elif n > 1:
-        types = [m["type"] for m in media_paths]
-        # Compact summary like "2 photo, 1 video"
         type_counts: dict[str, int] = {}
-        for t in types:
+        for t in media_types:
             type_counts[t] = type_counts.get(t, 0) + 1
         summary = ", ".join(f"{c} {t}" for t, c in type_counts.items())
-        label = f"Fetched {n} items ({summary}) — pick a topic:"
+        label = f"Fetched {n} items ({summary}) — pick a destination:"
     else:
-        # No media — will be sent as text
-        text_preview = (text_only or caption or "")[:50]
-        if text_preview:
-            label = f"Fetched text only (no media): \"{text_preview}...\" — pick a topic:"
-        else:
-            label = "Fetched text message — pick a topic:"
-    await status.edit_text(label, reply_markup=keyboard)
+        label = "Fetched message — pick a destination:"
+
+    # Use the same picker logic as direct forward — handles both forum and non-forum
+    # Note: For private chats, the chat_id equals the user's id.
+    from handlers.direct import _send_picker_new
+    # The user sent the link in a private chat with the bot, so chat_id == user_id
+    # _send_picker_new sends a NEW message (doesn't reply to the original link)
+    await _send_picker_new(context, update.effective_chat.id, pending_id, label)
 
 
 async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int) -> tuple[Optional[dict], Optional[str]]:
